@@ -53,10 +53,12 @@ add_library(svector SHARED
     src/index/hnsw/graph.cc
     src/index/hnsw/graph_ops.cc
     src/index/hnsw/layer_ops.cc
+    src/index/hnsw/resident_graph.cc
     src/storage/data_page.cc
     src/storage/root_page.cc
     src/storage/storage.cc
     src/native_vector.cc
+    src/quantize.cc
     src/vector.cc
 )
 

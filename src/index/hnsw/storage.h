@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -46,6 +47,12 @@ using vsql::preview_storage::MtrCtx;
 using vsql::preview_storage::Page;
 using vsql::preview_storage::Segment;
 using vsql::preview_storage::Space;
+
+// The resident (in-memory pointer) query graph, materialized once from this
+// on-disk store at the first scan. Held by unique_ptr so storage.h needn't
+// include resident_graph.h (which includes storage.h). Defined in
+// resident_graph.h; see IndexStore::resident().
+class ResidentGraph;
 
 // Default and bounds for the vsql_vector.ef_search session variable.
 inline constexpr long long DEFAULT_EF_SEARCH = 40;
@@ -415,6 +422,11 @@ class IndexStore {
   static constexpr size_t S_NUM_STORES = S_PK_STORE_INDEX + 1;
 
 public:
+  // Ctor/dtor out-of-line so foreign TUs (the SDK's Arena::construct in
+  // vector.cc) don't instantiate the m_resident unique_ptr's cleanup, which
+  // needs the complete ResidentGraph type only storage.cc has.
+  IndexStore();
+
   static constexpr size_t KEY_REF_SIZE = StorageMeta::ENTRY_POINT_LEN;
   bool create(const PkLayout &pk_layout, Space::Ref space_ref,
               Segment::TrxRef trx_ref, const Options &opts, char *err,
@@ -577,6 +589,23 @@ public:
                           Segment::TrxRef trx_ref, char *err, uint32_t err_len);
 
   const PkLayout &pk_layout() const { return m_pk_layout; }
+
+  // Resident query graph, materialized lazily at the first scan (see begin()).
+  // Null until then. unique_ptr to an incomplete type here => IndexStore's dtor
+  // is defined out-of-line in storage.cc (where ResidentGraph is complete).
+  std::unique_ptr<ResidentGraph> m_resident;
+
+public:
+  // The resident graph, or nullptr if not yet materialized. begin() builds it
+  // once via set_resident(); subsequent scans reuse it. Read-only after build.
+  // set_resident is out-of-line (storage.cc) so the unique_ptr assignment sees
+  // the complete ResidentGraph type; resident() only returns the raw pointer,
+  // so it stays inline.
+  ResidentGraph *resident() { return m_resident.get(); }
+  void set_resident(std::unique_ptr<ResidentGraph> g);
+
+  // Out-of-line so unique_ptr<ResidentGraph> sees the complete type.
+  ~IndexStore();
 };
 
 using StorageCtx = Index::StorageCtx<IndexStore>;

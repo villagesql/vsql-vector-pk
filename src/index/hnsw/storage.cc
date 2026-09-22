@@ -25,6 +25,7 @@
 
 #include "graph.h"
 #include "graph_ops.h"
+#include "resident_graph.h"
 
 #include <cassert>
 #include <cerrno>
@@ -785,6 +786,14 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
   }
 }
 
+// Out-of-line: unique_ptr<ResidentGraph> needs the complete type to destroy.
+IndexStore::IndexStore() = default;
+IndexStore::~IndexStore() = default;
+
+void IndexStore::set_resident(std::unique_ptr<ResidentGraph> g) {
+  m_resident = std::move(g);
+}
+
 bool IndexStore::create(const PkLayout &pk_layout, Space::Ref space_ref,
                         Segment::TrxRef trx_ref, const Options &opts, char *err,
                         uint32_t err_len) {
@@ -1029,14 +1038,33 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
   assert(scan_desc.is_knn());
   assert(scan_desc.num_keys() == 1 && scan_desc[0].is_knn());
 
-  IndexGraph graph(*ctx->user(), index, Segment::TrxRef{},
-                   index.get_max_col_len(VECTOR_KEY_POS),
-                   std::span<char>(err, err_len));
+  IndexStore *store = ctx->user();
+  const uint32_t max_col_len = index.get_max_col_len(VECTOR_KEY_POS);
 
-  IndexGraph::NodeData query{scan_desc[0][VECTOR_KEY_POS]};
+  // Materialize the resident query graph once, on the first scan. Driven by a
+  // temporary on-disk IndexGraph; the result is retained on the persistent
+  // IndexStore and reused by every later scan. (PoC: the on-disk graph is
+  // frozen for the insert-then-search benchmark flow.)
+  if (store->resident() == nullptr) {
+    IndexGraph build_graph(*store, index, Segment::TrxRef{}, max_col_len,
+                           std::span<char>(err, err_len));
+    auto rg = std::make_unique<ResidentGraph>();
+    if (materialize_resident_graph(build_graph, index, *rg, err, err_len))
+      return true;
+    store->set_resident(std::move(rg));
+  }
+  ResidentGraph &graph = *store->resident();
+
   const uint32_t k = scan_desc.limit();
   const uint32_t ef_search =
       std::max<uint32_t>(k, static_cast<uint32_t>(read_ef_search()));
+
+  // The query is the raw encoded vector, exactly as the on-disk path passed it.
+  // The resident graph owns all quantization: prepare_query decodes + quantizes
+  // it into the graph's own query buffer (storage stays quantization-free).
+  ResidentGraph::NodeData query;
+  if (graph.prepare_query(scan_desc[0][VECTOR_KEY_POS], query, err, err_len))
+    return true;
 
   // Materialize the FULL ef_search-ranked pool into the cursor, not just the
   // top k. The search already ranks all ef_search candidates (k is only a
@@ -1051,10 +1079,17 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
   //     the clustered lookup return DB_RECORD_NOT_FOUND; the server skips it and
   //     pulls the next candidate (see custom_index_knn_scan.cc Read()).
   // Passing ef_search as the result count makes search_knn keep the whole pool.
-  std::vector<Node> nodes;
-  if (GraphOperations<IndexGraph>(graph).search_knn(query, ef_search, ef_search,
-                                                    nodes))
+  std::vector<ResidentGraph::Node> rnodes;
+  if (GraphOperations<ResidentGraph>(graph).search_knn(query, ef_search,
+                                                       ef_search, rnodes))
     return true;
+
+  // Convert to on-disk Node{nid,vid} for the cursor + row resolution (which
+  // reads node->vid). The resident NodeObj carries both.
+  std::vector<Node> nodes;
+  nodes.reserve(rnodes.size());
+  for (const auto &rn : rnodes)
+    nodes.push_back(Node{rn.obj->nid, rn.obj->vid});
 
   auto *c = new Cursor(ctx->user(), std::move(nodes));
   *cursor = c;
