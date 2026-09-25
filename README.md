@@ -10,25 +10,17 @@ An extension for VillageSQL Server that adds a vector data type with external co
 > a downstream build of vsql-vector that stores the row's primary key *inside the
 > vector column store*, alongside each vector (a fixed-size "rowid trailer"). This
 > is what lets an HNSW index hit be resolved back to its **full row**, so a KNN
-> scan can return the row's other columns — mainline vsql-vector stores no rowid
-> and cannot do this. It is a **stop-gap** design chosen for simplicity while the
-> general row-reference mechanism is built.
+> scan can return the row's other columns; mainline vsql-vector stores no rowid
+> and cannot do this. This is the variant to use for end-to-end ANN.
 >
-> The tradeoff: because the key is folded into a fixed-size trailer, this variant
-> imposes limits on the primary key of an HNSW-indexed table that mainline does
-> not have:
+> Because the key is folded into a fixed-size trailer, the primary key of an
+> HNSW-indexed table is restricted:
 >
 > - The primary key must be a **single column** (composite keys are rejected at
 >   `CREATE INDEX`). PK-less tables are fine — InnoDB's synthetic 6-byte row id is
 >   used.
 > - That single key column must be **at most 32 bytes** (`ROWID_MAX`); wider keys
 >   are rejected at `CREATE INDEX`.
->
-> So the choice today is: mainline (any primary key, but no full-row resolution
-> during scan) vs. this variant (full-row resolution, but a restricted primary
-> key). Both limits will be lifted once a row-reference mechanism that supports
-> any primary key lands. See [`docs/rowid_storage.md`](docs/rowid_storage.md) for
-> the design, rationale, and the planned path there.
 
 ## Features
 
