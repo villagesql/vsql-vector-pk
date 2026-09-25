@@ -21,7 +21,6 @@
 SET PERSIST vsql_allow_preview_extensions = ON;
 INSTALL EXTENSION vsql_vector;
 
-
 --echo # ===================================================================
 --echo # 1. Composite primary key is rejected at CREATE INDEX
 --echo # ===================================================================
@@ -58,7 +57,6 @@ ALTER TABLE t_multi ADD INDEX idx_v (v) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t_multi;
 DROP TABLE t_multi;
 
-
 --echo # ===================================================================
 --echo # 2. Oversized single-column key is rejected at CREATE INDEX
 --echo # ===================================================================
@@ -87,7 +85,6 @@ INSERT INTO t_fit VALUES (REPEAT(_binary 'y', 32), '[5.0, 6.0, 7.0, 8.0]');
 # not directly scannable.
 SELECT COUNT(*) AS rows_after_insert FROM t_fit FORCE INDEX (PRIMARY);
 DROP TABLE t_fit;
-
 
 --echo # HNSW primary-key constraint test completed
 

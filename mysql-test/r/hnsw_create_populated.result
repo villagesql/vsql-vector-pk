@@ -1,0 +1,40 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+# --- Empty table: standalone CREATE INDEX succeeds ---
+CREATE TABLE t_empty (id INT PRIMARY KEY, v SVECTOR(4) NOT NULL);
+CREATE INDEX idx ON t_empty (v) USING EXTENDED(hnsw);
+SHOW CREATE TABLE t_empty;
+Table	Create Table
+t_empty	CREATE TABLE `t_empty` (
+  `id` int NOT NULL,
+  `v` vsql_vector.SVECTOR(4) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx` (`v` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_empty;
+# --- Populated table: standalone CREATE INDEX is rejected, not a crash ---
+CREATE TABLE t_full (id INT PRIMARY KEY, v SVECTOR(4) NOT NULL);
+INSERT INTO t_full VALUES (1, '[1.0, 2.0, 3.0, 4.0]'), (2, '[5.0, 6.0, 7.0, 8.0]');
+CREATE INDEX idx ON t_full (v) USING EXTENDED(hnsw);
+ERROR HY000: CREATE INDEX ... USING EXTENDED on a non-empty table is not supported yet; create the index before loading data.
+# --- Server survived: CREATE INDEX was rejected, so t_full has no custom
+#     index; a plain scan still works and the rows are intact ---
+SELECT COUNT(*) AS rows_after_rejected_create FROM t_full;
+rows_after_rejected_create
+2
+DROP TABLE t_full;
+# --- Supported path: index at CREATE TABLE, then load rows ---
+CREATE TABLE t_ok (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL,
+INDEX idx (v hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+INSERT INTO t_ok VALUES (1, '[1.0, 2.0, 3.0, 4.0]'), (2, '[5.0, 6.0, 7.0, 8.0]');
+SELECT id FROM t_ok ORDER BY L2_DISTANCE(v, '[1.0, 2.0, 3.0, 4.0]') LIMIT 1;
+id
+1
+DROP TABLE t_ok;
+# HNSW create-index-on-populated-table test completed
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
