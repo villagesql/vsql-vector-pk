@@ -23,6 +23,10 @@
 
 #include "storage.h"
 
+#ifdef SVECTOR_ROWID_TRAILER
+#include "../../storage/column_storage_rowid.h"
+#endif
+
 #include "graph.h"
 #include "graph_ops.h"
 
@@ -761,9 +765,23 @@ bool create(StorageCtx *ctx, const Index &index, Space::Ref space_ref,
   // server-side row-ref mapping (HAS_ROW_REF) instead.
   if (index.get_primary_num_key_cols() > 1) {
     snprintf(err, err_len,
-             "HNSW index requires a single-column key: the table's primary "
-             "key has %u columns; composite keys are not supported",
+             "HNSW index requires a single-column key (primary key has %u)",
              index.get_primary_num_key_cols());
+    return true;
+  }
+
+  // The rowid_prefix (the key column's stored value) is folded into each record
+  // in a fixed-size trailer of ColumnStorage::ROWID_MAX bytes. A key whose
+  // maximum storage length exceeds that cannot fit, so reject it here at CREATE
+  // INDEX rather than failing per-row at INSERT when an oversized value is
+  // written. get_primary_max_col_len reports the declared maximum for the single
+  // key column (key position 0).
+  const uint32_t pk_max_len = index.get_primary_max_col_len(0);
+  if (pk_max_len > svector::ColumnStorage::ROWID_MAX) {
+    snprintf(err, err_len,
+             "HNSW index requires a key of at most %u bytes (primary key is up "
+             "to %u bytes)",
+             svector::ColumnStorage::ROWID_MAX, pk_max_len);
     return true;
   }
 #endif  // SVECTOR_ROWID_TRAILER
