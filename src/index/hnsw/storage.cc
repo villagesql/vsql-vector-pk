@@ -23,9 +23,10 @@
 
 #include "storage.h"
 
-#ifdef SVECTOR_ROWID_TRAILER
+// Self-guards to nothing unless SVECTOR_ROWID_TRAILER is defined; the
+// can_store_key() call below is under the same macro, so no #ifdef is needed
+// here.
 #include "../../storage/column_storage_rowid.h"
-#endif
 
 #include "graph.h"
 #include "graph_ops.h"
