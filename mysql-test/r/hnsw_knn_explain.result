@@ -1,0 +1,45 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+v SVECTOR(4) NOT NULL,
+INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, '[1,2,3,4]');
+INSERT INTO t VALUES (2, '[4,3,2,1]');
+INSERT INTO t VALUES (3, '[1,2,3,6]');
+INSERT INTO t VALUES (4, '[9,9,9,9]');
+INSERT INTO t VALUES (5, '[2,2,3,4]');
+# --- Plan: a custom index distance scan on idx_v, no Sort/filesort ---
+EXPLAIN FORMAT=TREE
+SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
+EXPLAIN
+-> Limit: 10 row(s)  (cost=0.75 rows=5)
+    -> Custom index distance scan on idx_v  (cost=0.75 rows=5)
+
+# --- Result: nearest-first order 1, 5, 3, 2, 4 (not --sorted_result: the
+# --- order the plan produces is itself part of what is verified) ---
+SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
+id
+1
+5
+3
+2
+4
+# --- LIMIT smaller than the row set: the 3 nearest -> 1, 5, 3 ---
+SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 3;
+id
+1
+5
+3
+# --- Filter above the scan: id > 2 leaves {3,4,5}; nearest-first 5, 3, 4.
+# --- (5 - 3, not a bare literal, keeps this a filter above the scan.) ---
+SELECT id FROM t WHERE id > 5 - 3 ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
+id
+5
+3
+4
+DROP TABLE t;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
