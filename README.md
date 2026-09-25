@@ -202,6 +202,52 @@ ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
 LIMIT 10;
 ```
 
+#### Query-time tuning: `vsql_vector.ef_search`
+
+`ef_search` is a session variable that sets the HNSW query-time search breadth
+(the classic HNSW `ef`): the number of candidates the search keeps as it
+traverses the graph. Higher values improve recall at the cost of speed; lower
+values are faster but may miss nearest neighbours. It applies per connection to
+subsequent KNN queries.
+
+- Default: `40`. Range: `1` to `65536`.
+- It is floored at the query's `LIMIT` — if `LIMIT k` exceeds `ef_search`, `k` is
+  used, since the search must consider at least `k` candidates to return `k` rows.
+
+```sql
+-- Widen the search for higher recall on subsequent queries in this session.
+SET SESSION vsql_vector.ef_search = 200;
+
+SELECT id
+FROM docs
+ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
+LIMIT 10;
+```
+
+#### Filtering with a `WHERE` clause (post-filter limitation)
+
+A `WHERE` clause may be combined with a KNN `ORDER BY ... LIMIT`, but filtering
+is applied **after** the index search, not before. The HNSW scan first returns
+its nearest-neighbour candidates — at most `ef_search` of them — and the `WHERE`
+predicate is then applied to that candidate set.
+
+As a result, a selective `WHERE` can leave **fewer than `LIMIT` rows, or even
+zero**, even when enough matching rows exist further out in the graph: rows that
+satisfy the predicate but fall outside the top `ef_search` by distance are never
+considered. Raising `vsql_vector.ef_search` widens the candidate pool and can
+recover such rows, at the cost of a slower search; it is not a guarantee.
+
+```sql
+-- The category filter is applied to the top ef_search nearest rows only, so
+-- this may return fewer than 10 rows if few of the nearest neighbours are in
+-- category 7. Raise ef_search to widen the pool.
+SELECT id
+FROM docs
+WHERE category = 7
+ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
+LIMIT 10;
+```
+
 DDL and DML support on an HNSW-indexed table is currently limited. The index has
 no B-tree, so any operation that would maintain its entries is rejected with a
 clean error (the server is never crashed); operations that do not touch it are

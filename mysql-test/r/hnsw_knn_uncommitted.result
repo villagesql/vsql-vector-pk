@@ -1,0 +1,39 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+CREATE TABLE docs (
+id  INT PRIMARY KEY,
+vec SVECTOR(4) NOT NULL,
+INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+# Three committed rows.
+INSERT INTO docs VALUES
+(1, '[1.0, 0.0, 0.0, 0.0]'),
+(2, '[0.0, 1.0, 0.0, 0.0]'),
+(3, '[0.0, 0.0, 1.0, 0.0]');
+# --- Connection con1: insert a vector inside an open transaction ---
+START TRANSACTION;
+INSERT INTO docs VALUES (99, '[1.0, 1.0, 1.0, 1.0]');
+# --- Connection default: KNN read must not see con1's uncommitted row ---
+# LIMIT 10 exceeds the visible rows, so all committed rows come back. The
+# uncommitted id=99 must be absent, and the query must not error. The
+# committed vectors are equidistant from the query, so their relative
+# order is unspecified; --sorted_result compares the set, not the order.
+SELECT id FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 1.0, 1.0, 1.0]') LIMIT 10;
+id
+1
+2
+3
+# --- con1 commits; id=99 is now visible ---
+COMMIT;
+# After commit id=99 is visible and appears in the result.
+SELECT id FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 1.0, 1.0, 1.0]') LIMIT 10;
+id
+1
+2
+3
+99
+# HNSW uncommitted-row visibility test completed
+DROP TABLE docs;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
