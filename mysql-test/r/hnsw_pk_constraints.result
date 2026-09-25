@@ -1,0 +1,65 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+# ===================================================================
+# 1. Composite primary key is rejected at CREATE INDEX
+# ===================================================================
+# Inline composite PK + inline HNSW index: CREATE TABLE must fail.
+CREATE TABLE t_multi (
+a INT NOT NULL,
+b INT NOT NULL,
+v SVECTOR(4) NOT NULL,
+PRIMARY KEY (a, b),
+INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+ERROR HY000: Got error 168 'SVECTOR: rowid storage requires a single-column key (key has 2 columns)' from InnoDB
+# Same rejection via CREATE INDEX on an already-composite-PK table.
+CREATE TABLE t_multi (
+a INT NOT NULL,
+b INT NOT NULL,
+v SVECTOR(4) NOT NULL,
+PRIMARY KEY (a, b)
+) ENGINE=InnoDB;
+CREATE INDEX idx_v ON t_multi (v) USING EXTENDED(hnsw);
+ERROR HY000: SVECTOR: rowid storage requires a single-column key (key has 2 columns)
+# And via ALTER TABLE ADD INDEX.
+ALTER TABLE t_multi ADD INDEX idx_v (v) USING EXTENDED(hnsw);
+ERROR HY000: SVECTOR: rowid storage requires a single-column key (key has 2 columns)
+# The index was never created: the table has no HNSW index.
+SHOW CREATE TABLE t_multi;
+Table	Create Table
+t_multi	CREATE TABLE `t_multi` (
+  `a` int NOT NULL,
+  `b` int NOT NULL,
+  `v` vsql_vector.SVECTOR(4) NOT NULL,
+  PRIMARY KEY (`a`,`b`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_multi;
+# ===================================================================
+# 2. Oversized single-column key is rejected at CREATE INDEX
+# ===================================================================
+# The key's declared max length must fit the fixed rowid region, so a key
+# wider than the region is rejected up front -- no need to wait for an
+# oversized value at INSERT.
+# Declared max (64 bytes) exceeds the rowid region: CREATE TABLE must fail.
+CREATE TABLE t_wide (
+k VARBINARY(64) NOT NULL PRIMARY KEY,
+v SVECTOR(4) NOT NULL,
+INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+ERROR HY000: Got error 168 'SVECTOR: rowid storage requires a key of at most 32 bytes (key is up to 64 bytes)' from InnoDB
+# A key whose declared max fits the region is accepted, and rows insert.
+CREATE TABLE t_fit (
+k VARBINARY(32) NOT NULL PRIMARY KEY,
+v SVECTOR(4) NOT NULL,
+INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+INSERT INTO t_fit VALUES (REPEAT(_binary 'x', 8), '[1.0, 2.0, 3.0, 4.0]');
+INSERT INTO t_fit VALUES (REPEAT(_binary 'y', 32), '[5.0, 6.0, 7.0, 8.0]');
+SELECT COUNT(*) AS rows_after_insert FROM t_fit FORCE INDEX (PRIMARY);
+rows_after_insert
+2
+DROP TABLE t_fit;
+# HNSW primary-key constraint test completed
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
