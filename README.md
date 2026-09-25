@@ -1,8 +1,10 @@
 ![VillageSQL Logo](https://villagesql.com/assets/logo-light.svg)
 
-# VillageSQL Vector Extension
+# VillageSQL Vector Extension (vsql-vector-pk)
 
 An extension for VillageSQL Server that adds a vector data type with external columnar storage (SVECTOR), enabling efficient vector operations and laying the foundation for future ANN search and indexing.
+
+This is `vsql-vector-pk`, a downstream build of vsql-vector that stores the row's primary key in the vector column store so a KNN scan can resolve hits back to full rows (see the note below). It builds and installs as the `vsql_vector` extension.
 
 > **This extension is under active development and is not stable.** It depends on [VillageSQL experimental extension APIs](https://villagesql.com/docs/mysql-8.4/0.0.5-dev/extension-api-reference#experimental-apis) that are subject to breaking changes without notice. It is not recommended for production use.
 
@@ -44,8 +46,8 @@ An extension for VillageSQL Server that adds a vector data type with external co
 #### Build Instructions
 1. Clone the repository:
    ```bash
-   git clone https://github.com/villagesql/vsql-vector.git
-   cd vsql-vector
+   git clone https://github.com/villagesql/vsql-vector-pk.git
+   cd vsql-vector-pk
    ```
 
 2. Configure and build:
@@ -142,22 +144,13 @@ SELECT L2_DISTANCE(a.vec, b.vec) AS dist
 FROM embeddings a, embeddings b
 WHERE a.id = 1 AND b.id = 2;
 
--- Nearest-neighbour search by L1 distance (full table scan)
--- Note: HNSW index support is planned; today this performs a sequential scan.
--- The query vector is stored in a table row and joined in as a workaround
--- for the current limitation on inline constant vectors (see Known Limitations).
-SELECT id, L1_DISTANCE(vec, query.ref_vec) AS dist
-FROM embeddings,
-     (SELECT vec AS ref_vec FROM embeddings WHERE id = 1) AS query
+-- Nearest-neighbour search by L1 distance, with the query vector given inline
+-- as a string constant.
+SELECT id, L1_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]') AS dist
+FROM embeddings
 ORDER BY dist ASC
 LIMIT 2;
 -- Expected result: id=1 dist=0, id=2 dist=1
-
--- TODO: once inline constant vector support is added, the intended syntax is:
--- SELECT id, L1_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]') AS dist
--- FROM embeddings
--- ORDER BY dist ASC
--- LIMIT 2;
 
 -- Update a vector value
 UPDATE embeddings SET vec = '[0.5, 0.5, 0.5, 0.5]' WHERE id = 1;
@@ -166,9 +159,67 @@ UPDATE embeddings SET vec = '[0.5, 0.5, 0.5, 0.5]' WHERE id = 1;
 DELETE FROM embeddings WHERE id = 2;
 ```
 
-### Known Limitations
+### Indexing (HNSW)
 
-- **Inline constant vectors**: Using `SVECTOR::FROM_STRING(...)` as a direct function argument (e.g., `SVECTOR_DISTANCE_L2(col, SVECTOR::FROM_STRING('[1,2,3,4]'))`) currently fails because constant folding for parameterized custom types is not yet supported. As a workaround, store the query vector in a table row and join against it (as shown in the nearest-neighbour example above).
+An approximate-nearest-neighbour (ANN) HNSW index is created on an `SVECTOR`
+column with `USING EXTENDED(hnsw)`. The distance metric is selected by an operator
+class after the column name (default is L2 if omitted):
+
+| Operator class | Metric |
+|---|---|
+| `hnsw_l2` (default) | L2 (Euclidean) |
+| `hnsw_l1` | L1 (Manhattan) |
+| `hnsw_cosine` | Cosine |
+| `hnsw_inner_product` | Inner product |
+
+Because this variant stores the primary key in the vector column store (see the
+note at the top), the indexed table's primary key must be a **single column of at
+most 32 bytes**, or the table may be primary-key-less.
+
+```sql
+CREATE TABLE docs (
+    id    INT PRIMARY KEY,
+    vec   SVECTOR(4) NOT NULL,
+    -- Inline: an L2 HNSW index with tuning parameters.
+    INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+-- Or create the index separately (cosine metric, default parameters).
+CREATE INDEX idx_vec_cos ON docs (vec hnsw_cosine) USING EXTENDED(hnsw);
+
+-- Or via ALTER TABLE.
+ALTER TABLE docs ADD INDEX idx_vec_ip (vec hnsw_inner_product) USING EXTENDED(hnsw);
+```
+
+`WITH (M = ..., ef_construction = ...)` sets the HNSW build parameters. Query the
+index with an `ORDER BY <distance>(col, <query vector>) LIMIT k`, using the
+distance function matching the index's operator class:
+
+```sql
+SELECT id
+FROM docs
+ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
+LIMIT 10;
+```
+
+DDL and DML support on an HNSW-indexed table is currently limited. The index has
+no B-tree, so any operation that would maintain its entries is rejected with a
+clean error (the server is never crashed); operations that do not touch it are
+allowed:
+
+- **CREATE INDEX** must be run on an **empty table**. `CREATE INDEX ... USING
+  EXTENDED(hnsw)` on a table that already has rows is rejected — declare the
+  index at `CREATE TABLE` and load data afterwards.
+- **INSERT** is supported; the index is maintained as rows are inserted.
+- **DELETE** of a row is not supported.
+- **UPDATE** that changes the indexed vector column, or the primary key, is not
+  supported.
+- **UPDATE** of a non-indexed (payload) column **is** supported — it changes no
+  index ordering field, so the index is not touched.
+- **Upserts** (`REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE`) are rejected when
+  they hit an existing row, because they resolve to a delete or update. When they
+  insert a brand-new row (no key conflict) they behave as a plain, supported
+  INSERT.
 
 ## Testing
 
@@ -180,14 +231,14 @@ The extension includes tests using the MySQL Test Runner (MTR) framework.
 
 ```bash
 cd /path/to/villagesql/build/mysql-test
-perl mysql-test-run.pl --suite=/path/to/vsql-vector/mysql-test
+perl mysql-test-run.pl --suite=/path/to/vsql-vector-pk/mysql-test
 ```
 
 **Option 2: Using a VEB from the build directory**
 
 ```bash
 cd /path/to/villagesql/build/mysql-test
-perl mysql-test-run.pl --suite=/path/to/vsql-vector/mysql-test --veb-source-dir=/path/to/vsql-vector/build
+perl mysql-test-run.pl --suite=/path/to/vsql-vector-pk/mysql-test --veb-source-dir=/path/to/vsql-vector-pk/build
 ```
 
 ## Diagnostic Tools
@@ -273,7 +324,7 @@ Key observations:
 
 ### Project Structure
 ```
-vsql-vector/
+vsql-vector-pk/
 ├── src/
 │   ├── native_vector.h      # Vector type definitions and distance functions
 │   ├── native_vector.cc     # Encoding/decoding implementations
@@ -307,7 +358,7 @@ vsql-vector/
 
 ## Reporting Bugs and Requesting Features
 
-If you encounter a bug or have a feature request, please open an [issue](https://github.com/villagesql/vsql-vector/issues) using GitHub Issues.
+If you encounter a bug or have a feature request, please open an [issue](https://github.com/villagesql/vsql-vector-pk/issues) using GitHub Issues.
 
 ## License
 
@@ -319,6 +370,6 @@ VillageSQL welcomes contributions from the community. For more information, plea
 
 ## Contact
 
-- File a [bug or issue](https://github.com/villagesql/vsql-vector/issues) and we will review
-- Start a discussion in the project [discussions](https://github.com/villagesql/vsql-vector/discussions)
+- File a [bug or issue](https://github.com/villagesql/vsql-vector-pk/issues) and we will review
+- Start a discussion in the project [discussions](https://github.com/villagesql/vsql-vector-pk/discussions)
 - Join the [Discord channel](https://discord.gg/KSr6whd3Fr)

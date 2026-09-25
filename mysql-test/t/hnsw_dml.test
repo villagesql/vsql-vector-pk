@@ -1,0 +1,95 @@
+# DML on a table with an HNSW (USING EXTENDED) index.
+#
+# Documents the current, limited DML support for HNSW-indexed tables. The custom
+# index has no B-tree, so any operation that would maintain its secondary entry
+# is rejected; operations that do not touch it are allowed:
+#   1. DELETE of an indexed row is not supported.
+#   2. UPDATE that changes the indexed vector column is not supported.
+#   3. UPDATE that changes the primary key is not supported (it forces all
+#      secondary indexes, including the custom one, to be rebuilt).
+#   4. UPDATE of a non-indexed (payload) column IS supported -- it changes no
+#      index ordering field, so the custom index is not touched.
+#   5. Upserts (REPLACE, INSERT ... ON DUPLICATE KEY UPDATE) that resolve to a
+#      delete/update on a conflicting row are rejected, not crashed. A REPLACE
+#      that just inserts a new row is a plain insert and works.
+#
+# INSERT into an HNSW-indexed table is supported (the index is maintained on
+# insert) and is exercised as the fixture below.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE docs (
+  id      INT PRIMARY KEY,
+  vec     SVECTOR(4) NOT NULL,
+  payload VARCHAR(32),
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+--echo # INSERT is supported: rows go in and the index is maintained.
+INSERT INTO docs VALUES (1, '[1.0, 2.0, 3.0, 4.0]', 'one');
+INSERT INTO docs VALUES (2, '[5.0, 6.0, 7.0, 8.0]', 'two');
+INSERT INTO docs VALUES (3, '[9.0, 1.0, 2.0, 3.0]', 'three');
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # ===================================================================
+--echo # 1. DELETE of an indexed row is not supported
+--echo # ===================================================================
+--error ER_VILLAGESQL_GENERIC_ERROR
+DELETE FROM docs WHERE id = 2;
+
+--echo # The row is unchanged.
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # ===================================================================
+--echo # 2. UPDATE of the indexed vector column is not supported
+--echo # ===================================================================
+--error ER_VILLAGESQL_GENERIC_ERROR
+UPDATE docs SET vec = '[0.0, 0.0, 0.0, 0.0]' WHERE id = 1;
+
+--echo # The vector is unchanged (still nearest to its own value).
+SELECT id FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]') LIMIT 1;
+
+--echo # ===================================================================
+--echo # 3. UPDATE that changes the primary key is not supported
+--echo # ===================================================================
+--error ER_VILLAGESQL_GENERIC_ERROR
+UPDATE docs SET id = 10 WHERE id = 1;
+
+--echo # The primary key is unchanged.
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # ===================================================================
+--echo # 4. UPDATE of a non-indexed (payload) column is supported
+--echo # ===================================================================
+--echo # It changes no index ordering field, so the custom index is not touched.
+UPDATE docs SET payload = 'ONE' WHERE id = 1;
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # ===================================================================
+--echo # 5. Upserts that resolve to a delete/update are rejected (not a crash)
+--echo # ===================================================================
+--echo # REPLACE on a key conflict resolves to an update of the existing row,
+--echo # so it hits the unsupported update path. (id = 1 already exists.)
+--error ER_VILLAGESQL_GENERIC_ERROR
+REPLACE INTO docs VALUES (1, '[1.0, 1.0, 1.0, 1.0]', 'replaced');
+
+--echo # INSERT ... ON DUPLICATE KEY UPDATE that changes the vector hits the
+--echo # unsupported update path on the conflicting row.
+--error ER_VILLAGESQL_GENERIC_ERROR
+INSERT INTO docs VALUES (1, '[2.0, 2.0, 2.0, 2.0]', 'dup')
+  ON DUPLICATE KEY UPDATE vec = '[2.0, 2.0, 2.0, 2.0]';
+
+--echo # The row is unchanged by either rejected upsert.
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # A REPLACE that inserts a brand-new row (no conflict) is a plain INSERT
+--echo # and is supported.
+REPLACE INTO docs VALUES (4, '[4.0, 4.0, 4.0, 4.0]', 'four');
+SELECT id, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY id;
+
+--echo # HNSW DML test completed
+DROP TABLE docs;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
