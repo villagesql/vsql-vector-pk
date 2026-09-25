@@ -23,6 +23,11 @@
 
 #include "storage.h"
 
+// Self-guards to nothing unless SVECTOR_ROWID_TRAILER is defined; the
+// can_store_key() call below is under the same macro, so no #ifdef is needed
+// here.
+#include "../../storage/column_storage_rowid.h"
+
 #include "graph.h"
 #include "graph_ops.h"
 
@@ -749,6 +754,22 @@ bool IndexStore::load(Index::StorageRef storage_ref, const Options &opts,
 
 bool create(StorageCtx *ctx, const Index &index, Space::Ref space_ref,
             Segment::TrxRef trx_ref, char *err, uint32_t err_len) {
+#ifdef SVECTOR_ROWID_TRAILER
+  // Colocated row resolution (HAS_COLUMN_REF) stores the row's clustered key as
+  // the rowid_prefix alongside the vector, so a col_ref hit resolves back to
+  // its row. Whether the column storage can hold a given key is the storage's
+  // own concern; describe the key (parts and per-part max length) and let it
+  // decide, rejecting an unsupported key here at CREATE INDEX rather than
+  // per-row at INSERT.
+  const uint32_t num_key_parts = index.get_primary_num_key_cols();
+  std::vector<uint32_t> part_max_lens(num_key_parts);
+  for (uint32_t i = 0; i < num_key_parts; ++i)
+    part_max_lens[i] = index.get_primary_max_col_len(i);
+  if (svector::ColumnStorage::can_store_key(num_key_parts, part_max_lens.data(),
+                                            err, err_len))
+    return true;
+#endif // SVECTOR_ROWID_TRAILER
+
   const auto *opts = index.options<Options>();
   assert(opts != nullptr);
   auto *store = ctx->user();
