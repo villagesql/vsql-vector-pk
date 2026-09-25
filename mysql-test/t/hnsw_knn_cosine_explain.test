@@ -1,0 +1,51 @@
+# KNN query routing for the HNSW SVECTOR index under the COSINE metric: an
+# ORDER BY COSINE_DISTANCE(v, <literal>) LIMIT k query is served by the custom
+# index distance scan (not a full table scan + filesort), and returns rows in
+# ascending-cosine-distance (most-similar-direction first) order.
+#
+# Cosine distance is 0 for the same direction, 1 for orthogonal, 2 for opposite,
+# and is magnitude-independent -- so ordering is by angle, ASC (nearest = most
+# similar direction), the same sort direction as L2. See hnsw_knn_explain.test
+# for the L2 counterpart and the plan-shape rationale (EXPLAIN FORMAT=TREE is
+# used because the hypergraph optimizer rejects the default TRADITIONAL format).
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+# Distinct angles from the query [1,0,0,0] so ORDER BY is unambiguous. Cosine
+# distance = 1 - cos(angle), magnitude-independent:
+#   id 1 [ 1, 0,0,0]  ->   0deg  -> 0      (same direction)
+#   id 2 [ 1, 1,0,0]  ->  45deg  -> ~0.293
+#   id 3 [ 0, 1,0,0]  ->  90deg  -> 1      (orthogonal)
+#   id 4 [-1, 1,0,0]  -> 135deg  -> ~1.707
+#   id 5 [-1, 0,0,0]  -> 180deg  -> 2      (opposite)
+INSERT INTO t VALUES (1, '[1,0,0,0]');
+INSERT INTO t VALUES (2, '[1,1,0,0]');
+INSERT INTO t VALUES (3, '[0,1,0,0]');
+INSERT INTO t VALUES (4, '[-1,1,0,0]');
+INSERT INTO t VALUES (5, '[-1,0,0,0]');
+
+--echo # --- Plan: a custom index distance scan on idx_v, no Sort/filesort ---
+EXPLAIN FORMAT=TREE
+  SELECT id FROM t ORDER BY COSINE_DISTANCE(v, '[1,0,0,0]') LIMIT 10;
+
+--echo # --- Result: nearest-first by angle -> 1, 2, 3, 4, 5 ---
+SELECT id FROM t ORDER BY COSINE_DISTANCE(v, '[1,0,0,0]') LIMIT 10;
+
+--echo # --- LIMIT smaller than the row set: the 3 most-similar -> 1, 2, 3 ---
+SELECT id FROM t ORDER BY COSINE_DISTANCE(v, '[1,0,0,0]') LIMIT 3;
+
+--echo # --- Filter above the scan: id > 2 leaves {3,4,5}; nearest-first 3, 4, 5.
+--echo # --- (5 - 3, not a bare literal, keeps this a filter above the scan.) ---
+SELECT id FROM t WHERE id > 5 - 3 ORDER BY COSINE_DISTANCE(v, '[1,0,0,0]') LIMIT 10;
+
+DROP TABLE t;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
