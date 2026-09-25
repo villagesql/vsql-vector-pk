@@ -1,0 +1,62 @@
+# A KNN scan must not return a row that is not visible to the reader's
+# transaction, even though the HNSW graph is not MVCC-filtered.
+#
+# The graph node for an inserted vector is added immediately, before commit, so a
+# concurrent reader's KNN scan can surface that node. Resolving the hit to its
+# row is MVCC-filtered, so while the insert is uncommitted the row is not visible
+# and the scan must SKIP it (and NOT error). Once the insert commits, the row
+# becomes visible and appears in the result.
+#
+# LIMIT is larger than the row count, so the result is the full set of visible
+# rows regardless of distance ordering -- the only question is whether the
+# uncommitted vector leaks in (it must not) and whether the query succeeds.
+#
+# Note: the transaction is committed, not rolled back -- ROLLBACK on a
+# custom-indexed table is not supported (the index insert cannot be undone).
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE docs (
+  id  INT PRIMARY KEY,
+  vec SVECTOR(4) NOT NULL,
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+--echo # Three committed rows.
+INSERT INTO docs VALUES
+  (1, '[1.0, 0.0, 0.0, 0.0]'),
+  (2, '[0.0, 1.0, 0.0, 0.0]'),
+  (3, '[0.0, 0.0, 1.0, 0.0]');
+
+--echo # --- Connection con1: insert a vector inside an open transaction ---
+--connect (con1, localhost, root,,)
+START TRANSACTION;
+# id=99 is the nearest vector to the query below; if the scan failed to skip it,
+# it would appear first in the result (or, before the fix, error the query).
+INSERT INTO docs VALUES (99, '[1.0, 1.0, 1.0, 1.0]');
+
+--echo # --- Connection default: KNN read must not see con1's uncommitted row ---
+--connection default
+--echo # LIMIT 10 exceeds the visible rows, so all committed rows come back. The
+--echo # uncommitted id=99 must be absent, and the query must not error. The
+--echo # committed vectors are equidistant from the query, so their relative
+--echo # order is unspecified; --sorted_result compares the set, not the order.
+--sorted_result
+SELECT id FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 1.0, 1.0, 1.0]') LIMIT 10;
+
+--echo # --- con1 commits; id=99 is now visible ---
+--connection con1
+COMMIT;
+--disconnect con1
+
+--connection default
+--echo # After commit id=99 is visible and appears in the result.
+--sorted_result
+SELECT id FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 1.0, 1.0, 1.0]') LIMIT 10;
+
+--echo # HNSW uncommitted-row visibility test completed
+DROP TABLE docs;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
