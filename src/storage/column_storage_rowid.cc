@@ -28,7 +28,8 @@
 // since the ColumnStorage declaration this file defines is itself behind the
 // macro in the header.
 #ifndef SVECTOR_ROWID_TRAILER
-#error "column_storage_rowid.cc must be compiled with SVECTOR_ROWID_TRAILER defined"
+#error                                                                         \
+    "column_storage_rowid.cc must be compiled with SVECTOR_ROWID_TRAILER defined"
 #endif
 
 #include "column_storage_rowid.h"
@@ -46,6 +47,31 @@
 
 namespace svector {
 
+bool ColumnStorage::can_store_key(uint32_t num_key_parts,
+                                  const uint32_t *part_max_lens, char *err,
+                                  uint32_t err_len) {
+  // The rowid trailer holds a single clustered-key field. A composite key would
+  // store only its first part and resolve ambiguously, so reject it.
+  if (num_key_parts != 1) {
+    snprintf(err, err_len,
+             "SVECTOR: rowid storage requires a single-column key (key has %u "
+             "columns)",
+             num_key_parts);
+    return true;
+  }
+  // That single part's value is folded into a fixed ROWID_MAX-byte trailer, so
+  // a wider key cannot fit.
+  if (part_max_lens[0] > ROWID_MAX) {
+    snprintf(
+        err, err_len,
+        "SVECTOR: rowid storage requires a key of at most %u bytes (key is "
+        "up to %u bytes)",
+        ROWID_MAX, part_max_lens[0]);
+    return true;
+  }
+  return false;
+}
+
 bool ColumnStorage::create(Ctx *storage, Space::Ref space,
                            Segment::TrxRef trx_ref, uint32_t col_len,
                            char *error_msg, uint32_t error_msg_len) {
@@ -62,6 +88,14 @@ bool ColumnStorage::create(Ctx *storage, Space::Ref space,
   // leading store_len bytes are the vector and the rest is the trailer. The
   // inflated size is persisted in the root page, so load() recovers it without
   // needing to know the trailer size.
+  //
+  // TODO(villagesql-indexing): size the trailer to this index's actual key max
+  // length (passed in from create-time, bounded by ROWID_MAX as the cap)
+  // instead of a fixed ROWID_TRAILER_LEN, so ROWID_MAX can be raised without
+  // wasting the full width per record for small keys. The chosen width is
+  // already persisted here and recovered by load(); insert()/select() must then
+  // read the trailer capacity from that persisted record size rather than the
+  // ROWID_TRAILER_LEN constant.
   uint16_t vector_len = static_cast<uint16_t>(col_len - sizeof(Column::Ref));
   uint16_t store_len = static_cast<uint16_t>(vector_len + ROWID_TRAILER_LEN);
   constexpr uint8_t NUM_SEGMENTS = 1;
@@ -69,7 +103,8 @@ bool ColumnStorage::create(Ctx *storage, Space::Ref space,
   auto *col_store = storage->user();
   bool err = col_store->create(space, trx_ref, {{store_len, "SVECTOR"}},
                                NUM_SEGMENTS, error_msg, error_msg_len);
-  if (!err) storage->set_ref(col_store->m_ref);
+  if (!err)
+    storage->set_ref(col_store->m_ref);
   return err;
 }
 
@@ -102,6 +137,8 @@ bool ColumnStorage::insert(Ctx *storage, MtrCtx::Ref mctx,
   // fixed size the engine was created with. Assembled in a local buffer (insert
   // is not the hot path -- search/distance is), so no shared state and no data
   // race between concurrent inserts.
+  // TODO(villagesql-indexing): use this index's persisted trailer capacity, not
+  // the fixed ROWID_TRAILER_LEN/ROWID_MAX; see create() for the plan.
   const uint16_t payload_len =
       static_cast<uint16_t>(col_data.length + ROWID_TRAILER_LEN);
   std::vector<unsigned char> record(payload_len);
@@ -125,10 +162,11 @@ bool ColumnStorage::select(Ctx *storage, MtrCtx::Ref mctx, Column::Ref col_ref,
   // The engine returns the full opaque record ([vector][trailer]); split it
   // back into the vector (leading bytes) and the rowid (in the trailer). Both
   // point in-page, no copy.
-  if (storage->user()->m_stores[0].fetch(mctx, col_ref, /*for_update=*/false,
-                                         *col_data, *rowid_prefix, *trx_ref,
-                                         *delete_marked, error_msg,
-                                         error_msg_len))
+  // TODO(villagesql-indexing): derive the trailer capacity from this index's
+  // persisted record size, not the fixed ROWID_TRAILER_LEN; see create().
+  if (storage->user()->m_stores[0].fetch(
+          mctx, col_ref, /*for_update=*/false, *col_data, *rowid_prefix,
+          *trx_ref, *delete_marked, error_msg, error_msg_len))
     return true;
 
   if (col_data->length < ROWID_TRAILER_LEN) {
@@ -160,11 +198,11 @@ bool ColumnStorage::mark_delete(Ctx *storage, MtrCtx::Ref mctx,
       mctx, trx_ref, col_ref, delete_mark, error_msg, error_msg_len);
 }
 
-bool ColumnStorage::purge(Ctx *storage, MtrCtx::Ref mctx, Segment::TrxRef trx_ref,
-                          Column::Ref col_ref, char *error_msg,
-                          uint32_t error_msg_len) {
+bool ColumnStorage::purge(Ctx *storage, MtrCtx::Ref mctx,
+                          Segment::TrxRef trx_ref, Column::Ref col_ref,
+                          char *error_msg, uint32_t error_msg_len) {
   return storage->user()->m_stores[0].purge(mctx, trx_ref, col_ref, error_msg,
                                             error_msg_len);
 }
 
-}  // namespace svector
+} // namespace svector

@@ -956,6 +956,6 @@ bool ColumnStorage::purge(Ctx *storage, MtrCtx::Ref mctx,
                                             error_msg_len);
 }
 
-#endif  // !SVECTOR_ROWID_TRAILER
+#endif // !SVECTOR_ROWID_TRAILER
 
 }  // namespace svector

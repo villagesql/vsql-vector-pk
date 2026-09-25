@@ -233,7 +233,7 @@ class ColumnStorage {
                      Column::Ref col_ref, char *error_msg,
                      uint32_t error_msg_len);
 };
-#endif  // !SVECTOR_ROWID_TRAILER
+#endif // !SVECTOR_ROWID_TRAILER
 
 }  // namespace svector
 

@@ -754,37 +754,20 @@ bool IndexStore::load(Index::StorageRef storage_ref, const Options &opts,
 bool create(StorageCtx *ctx, const Index &index, Space::Ref space_ref,
             Segment::TrxRef trx_ref, char *err, uint32_t err_len) {
 #ifdef SVECTOR_ROWID_TRAILER
-  // Colocated row resolution (HAS_COLUMN_REF) stores only the leading field of
-  // the row's clustered key (rowid_prefix) alongside the vector, so a row can
-  // be resolved from a col_ref hit. That is complete only when the clustered
-  // key is a single field -- a single-column PRIMARY KEY, a promoted
-  // single-column UNIQUE, or a PK-less table (InnoDB's synthetic rowid, which
-  // reports 1). A composite (multi-field) key would store only its first
-  // column and resolve ambiguously, so reject it at CREATE INDEX rather than
-  // silently returning wrong rows at query time. Composite keys need
-  // server-side row-ref mapping (HAS_ROW_REF) instead.
-  if (index.get_primary_num_key_cols() > 1) {
-    snprintf(err, err_len,
-             "HNSW index requires a single-column key (primary key has %u)",
-             index.get_primary_num_key_cols());
+  // Colocated row resolution (HAS_COLUMN_REF) stores the row's clustered key as
+  // the rowid_prefix alongside the vector, so a col_ref hit resolves back to
+  // its row. Whether the column storage can hold a given key is the storage's
+  // own concern; describe the key (parts and per-part max length) and let it
+  // decide, rejecting an unsupported key here at CREATE INDEX rather than
+  // per-row at INSERT.
+  const uint32_t num_key_parts = index.get_primary_num_key_cols();
+  std::vector<uint32_t> part_max_lens(num_key_parts);
+  for (uint32_t i = 0; i < num_key_parts; ++i)
+    part_max_lens[i] = index.get_primary_max_col_len(i);
+  if (svector::ColumnStorage::can_store_key(num_key_parts, part_max_lens.data(),
+                                            err, err_len))
     return true;
-  }
-
-  // The rowid_prefix (the key column's stored value) is folded into each record
-  // in a fixed-size trailer of ColumnStorage::ROWID_MAX bytes. A key whose
-  // maximum storage length exceeds that cannot fit, so reject it here at CREATE
-  // INDEX rather than failing per-row at INSERT when an oversized value is
-  // written. get_primary_max_col_len reports the declared maximum for the single
-  // key column (key position 0).
-  const uint32_t pk_max_len = index.get_primary_max_col_len(0);
-  if (pk_max_len > svector::ColumnStorage::ROWID_MAX) {
-    snprintf(err, err_len,
-             "HNSW index requires a key of at most %u bytes (primary key is up "
-             "to %u bytes)",
-             svector::ColumnStorage::ROWID_MAX, pk_max_len);
-    return true;
-  }
-#endif  // SVECTOR_ROWID_TRAILER
+#endif // SVECTOR_ROWID_TRAILER
 
   const auto *opts = index.options<Options>();
   assert(opts != nullptr);

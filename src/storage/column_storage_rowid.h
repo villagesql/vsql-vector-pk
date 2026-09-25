@@ -53,13 +53,28 @@
 namespace svector {
 
 class ColumnStorage {
- public:
+public:
   using Ctx = Column::StorageCtx<MultiColumnStore>;
 
   // Maximum rowid_prefix bytes stored per record, and the total trailer size
   // ([rowid_len:1][rowid:ROWID_MAX]) folded into each record.
+  // TODO(villagesql-indexing): today this is also the per-record trailer width;
+  // make it the upper bound (cap) only, and size each index's trailer to its
+  // actual key length so raising ROWID_MAX does not waste space for small keys.
+  // See ColumnStorage::create().
   static constexpr uint8_t ROWID_MAX = 32;
   static constexpr uint16_t ROWID_TRAILER_LEN = 1 + ROWID_MAX;
+
+  // Whether this storage can faithfully hold the row's clustered key as the
+  // rowid_prefix trailer, given the key's shape (@p num_key_parts parts, with
+  // @p part_max_lens[i] the maximum stored length of each part). The trailer
+  // stores a single field up to ROWID_MAX bytes, so a composite key resolves
+  // ambiguously and an oversized one does not fit. Checked at CREATE INDEX so
+  // an unsupported key is rejected up front rather than per-row at INSERT.
+  // @return false if the key can be stored; true (with @p err set) if not.
+  static bool can_store_key(uint32_t num_key_parts,
+                            const uint32_t *part_max_lens, char *err,
+                            uint32_t err_len);
 
   static bool create(Ctx *storage, Space::Ref space, Segment::TrxRef trx_ref,
                      uint32_t col_len, char *error_msg, uint32_t error_msg_len);
@@ -90,8 +105,8 @@ class ColumnStorage {
                     uint32_t error_msg_len);
 };
 
-}  // namespace svector
+} // namespace svector
 
-#endif  // SVECTOR_ROWID_TRAILER
+#endif // SVECTOR_ROWID_TRAILER
 
-#endif  // VILLAGESQL_EXAMPLES_VSQL_SVECTOR_SRC_STORAGE_COLUMN_STORAGE_ROWID_H
+#endif // VILLAGESQL_EXAMPLES_VSQL_SVECTOR_SRC_STORAGE_COLUMN_STORAGE_ROWID_H
