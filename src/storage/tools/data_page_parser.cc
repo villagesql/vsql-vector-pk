@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <iostream>
 
+#include "../column_storage_rowid.h" // ColumnStorage::ROWID_TRAILER_LEN (self-guarded)
 #include "../root_page.h"
 
 namespace svector {
@@ -153,7 +154,20 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
   info.records.clear();
   info.records.reserve(info.max_num_recs);
 
-  uint32_t vector_dim = (column_size) / sizeof(float);
+  // For the SVECTOR base-column store with a rowid trailer, column_size is the
+  // inflated record payload (vector + [rowid_len:1][rowid:ROWID_MAX]); the
+  // leading bytes are the vector. Recover the vector length so the trailing
+  // trailer bytes are not mis-decoded as extra float dimensions.
+#ifdef SVECTOR_ROWID_TRAILER
+  const uint16_t rowid_trailer_len = svector::ColumnStorage::ROWID_TRAILER_LEN;
+  const uint32_t vector_bytes =
+      (index_kind == HnswRecordKind::None && column_size > rowid_trailer_len)
+          ? column_size - rowid_trailer_len
+          : column_size;
+#else
+  const uint32_t vector_bytes = column_size;
+#endif
+  uint32_t vector_dim = vector_bytes / sizeof(float);
 
   // Derived from column_size the same way the root page's display() does
   // (see hnsw_layout.h) -- only meaningful for the matching index_kind.
@@ -212,6 +226,26 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
             rec.vector_data.push_back(read_float(page_data, float_offset));
           }
         }
+#ifdef SVECTOR_ROWID_TRAILER
+        // The rowid trailer follows the vector: [rowid_len:1][rowid:ROWID_MAX].
+        // rowid_len is the actual length; the rest is zero padding. The stored
+        // rowid is a single opaque blob (no persisted field boundaries), so it
+        // is recorded as one part; the list form leaves room for N parts later.
+        uint32_t trailer_off = off + vector_bytes;
+        if (trailer_off < page_data.size()) {
+          uint8_t rowid_len = read_uint8(page_data, trailer_off);
+          uint32_t rowid_off = trailer_off + 1;
+          rec.has_rowid = true;
+          std::vector<uint8_t> part;
+          part.reserve(rowid_len);
+          for (uint8_t b = 0; b < rowid_len; ++b) {
+            if (rowid_off + b < page_data.size()) {
+              part.push_back(page_data[rowid_off + b]);
+            }
+          }
+          rec.rowid_parts.push_back(std::move(part));
+        }
+#endif
       }
     } else {
       rec.trx_ref = 0;
@@ -305,7 +339,10 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
         }
         std::cout << "  [" << std::setw(3) << i << "] ";
         std::cout << "Trx ID:" << std::setw(12) << rec.trx_ref;
-        if (rec.is_deleted) {
+        // For the multi-line HNSW records the marker goes on the header line;
+        // for a single-line vector record it reads better at the end (after the
+        // data and rowid), appended below.
+        if (rec.is_deleted && info.index_kind != HnswRecordKind::None) {
           std::cout << " (DELETED)";
         }
 
@@ -367,7 +404,27 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
             std::cout << std::fixed << std::setprecision(2)
                       << rec.vector_data[j];
           }
-          std::cout << "]\n";
+          std::cout << "]";
+          if (rec.has_rowid) {
+            // List form (one part today) so a multi-part key needs no format
+            // change: Rowid:[<hex>] now, Rowid:[<hex>, <hex>, ...] later.
+            std::cout << " Rowid:[";
+            for (size_t p = 0; p < rec.rowid_parts.size(); ++p) {
+              if (p > 0)
+                std::cout << ", ";
+              std::cout << "0x";
+              for (uint8_t b : rec.rowid_parts[p]) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0')
+                          << static_cast<int>(b);
+              }
+              std::cout << std::dec << std::setfill(' ');
+            }
+            std::cout << "]";
+          }
+          if (rec.is_deleted) {
+            std::cout << " (DELETED)";
+          }
+          std::cout << "\n";
         }
         shown++;
       }

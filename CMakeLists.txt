@@ -125,6 +125,12 @@ target_include_directories(svector_page_dump PRIVATE
     ${VillageSQLExtensionFramework_INCLUDE_DIR}
 )
 
+# Match the storage layout the extension was built with, so the tool interprets
+# the rowid trailer (or its absence) the same way the on-disk records were written.
+if(SVECTOR_ROWID_TRAILER)
+  target_compile_definitions(svector_page_dump PRIVATE SVECTOR_ROWID_TRAILER)
+endif()
+
 # Standalone unit tests. These have no dependency on the VillageSQL SDK.
 # They are assert()-based, so NDEBUG (defined by default in Release and
 # RelWithDebInfo builds) must never suppress their checks -- without -UNDEBUG

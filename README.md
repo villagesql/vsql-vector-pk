@@ -309,7 +309,7 @@ SVECTOR Root Page
 Version:           1
 Page Type:         1 (ROOT_PAGE)
 Creator:           SVECTOR
-Column Size:       16 bytes (4-dim float vector)
+Column Size:       49 bytes (4-dim float vector + 33-byte rowid trailer)
 
 Data Pages:
   Total:           1
@@ -353,12 +353,18 @@ Record Bitmap:
   (. = Free, A = Active, D = Deleted)
 
 Records (showing from slot 0, up to 10 records):
-  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40]
-  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] (DELETED)
-  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50]
-  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] (DELETED)
-  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44]
+  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40] Rowid:[0x80000001]
+  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] Rowid:[0x80000002] (DELETED)
+  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50] Rowid:[0x80000003]
+  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] Rowid:[0x80000004] (DELETED)
+  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44] Rowid:[0x80000005]
 ```
+
+The `Rowid:[...]` field is the owning row's primary key stored alongside the
+vector (the "rowid trailer"), so an index hit resolves back to its row. It is a
+list to leave room for multi-part keys; today it is always a single element. The
+example values are a single-column `INT` primary key in InnoDB's clustered-key
+byte format (the sign bit is set, so key `1` is `0x80000001`).
 
 Key observations:
 - **`DELETED` records** (slots 1 and 3) are still physically present and visible to concurrent transactions that started before the DELETE committed (MVCC). They are reclaimed by the purge thread once no active transaction can see them.
@@ -372,35 +378,40 @@ Key observations:
 ```
 vsql-vector-pk/
 ├── src/
-│   ├── native_vector.h      # Vector type definitions and distance functions
-│   ├── native_vector.cc     # Encoding/decoding implementations
-│   ├── vector.cc            # VDF implementations and extension registration
-│   └── storage/
-│       ├── storage.h        # ColumnStorage class declarations
-│       ├── storage.cc       # Insert/delete/purge/fetch operations
-│       ├── root_page.h      # Root page structure and free slot management
-│       ├── root_page.cc     # Root page operations
-│       ├── data_page.h      # Data page structure and slot management
-│       ├── data_page.cc     # Record insert/purge and bitmap operations
-│       └── tools/
-│           ├── README.md             # Page dump tool documentation
-│           ├── svector_page_dump.cc  # Page dump tool driver
-│           ├── page_reader.h/cc      # IBD file reader
-│           ├── root_page_parser.h/cc # Root page parser
-│           └── data_page_parser.h/cc # Data page parser
+│   ├── native_vector.h        # SVECTOR type definition and encode/decode
+│   ├── native_vector.cc       # Encoding/decoding implementations
+│   ├── distance_registry.h    # Distance/similarity function registry
+│   ├── vector.cc              # VDF implementations and extension registration
+│   ├── storage/               # SVECTOR column storage (InnoDB-backed)
+│   │   ├── storage.h/.cc               # Column store engine (fixed-size records)
+│   │   ├── column_storage_rowid.h/.cc  # Rowid-trailer ColumnStorage adapter
+│   │   ├── root_page.h/.cc             # Root page structure and free-slot mgmt
+│   │   ├── data_page.h/.cc             # Data page structure and slot mgmt
+│   │   └── tools/                      # svector_page_dump and its parsers
+│   │       ├── README.md               # Page dump tool documentation
+│   │       ├── svector_page_dump.cc    # Page dump tool driver
+│   │       ├── page_reader.h/.cc       # IBD file reader
+│   │       ├── root_page_parser.h/.cc  # Root page parser
+│   │       ├── data_page_parser.h/.cc  # Data page parser
+│   │       ├── hnsw_layout.h/.cc       # HNSW record layout helpers
+│   │       └── hnsw_graph.h/.cc        # HNSW graph rendering (-g)
+│   └── index/
+│       └── hnsw/              # HNSW ANN index implementation
+│           ├── hnsw.h                  # Shared HNSW types/constants
+│           ├── storage.h/.cc           # Index storage (graph levels/nodes)
+│           ├── graph.h/.cc             # Graph structure
+│           ├── graph_ops.h/.cc         # Graph operations (search/insert)
+│           ├── layer_ops.h/.cc         # Per-layer operations
+│           └── visibility_policy.h     # MVCC visibility for scans
 ├── cmake/
-│   └── FindVillageSQL.cmake # CMake module to locate VillageSQL SDK
+│   └── FindVillageSQL.cmake  # CMake module to locate VillageSQL SDK
 ├── mysql-test/
-│   ├── t/                   # MTR test files
-│   └── r/                   # MTR expected results
-├── manifest.json            # VEB package manifest
-└── CMakeLists.txt           # Build configuration
+│   ├── t/                    # MTR test files
+│   ├── r/                    # MTR expected results
+│   └── unittest/             # Standalone unit tests
+├── manifest.json             # VEB package manifest
+└── CMakeLists.txt            # Build configuration
 ```
-
-## Roadmap
-
-- [ ] Support for inline constant vectors and bound parameter vectors in distance functions
-- [ ] HNSW index for approximate nearest-neighbour (ANN) search
 
 ## Reporting Bugs and Requesting Features
 
