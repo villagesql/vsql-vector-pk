@@ -46,6 +46,17 @@ class DataPageParser {
     std::vector<float> vector_data; // Decoded vector (assuming float32);
                                     // valid when index_kind == None
 
+    // SVECTOR base-column store only (index_kind == None), when the store keeps
+    // a rowid trailer: the owning row's clustered-key prefix stored after the
+    // vector. has_rowid is false for stores without a trailer.
+    //
+    // A list of key parts so the format extends to a multi-part key without
+    // changing: today the stored rowid is a single opaque blob (field
+    // boundaries are not persisted), so this holds exactly one entry; when the
+    // store persists per-part boundaries it can hold N.
+    bool has_rowid = false;
+    std::vector<std::vector<uint8_t>> rowid_parts; // each part: its bytes only
+
     // Valid only when index_kind == HnswRecordKind::Neighbour, decoding the
     // record per svector::hnsw::NeighbourEntry's layout.
     uint64_t owner_vid = 0;
