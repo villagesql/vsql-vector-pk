@@ -50,23 +50,23 @@ namespace svector {
 bool ColumnStorage::can_store_key(uint32_t num_key_parts,
                                   const uint32_t *part_max_lens, char *err,
                                   uint32_t err_len) {
-  // The rowid trailer holds a single clustered-key field. A composite key would
-  // store only its first part and resolve ambiguously, so reject it.
-  if (num_key_parts != 1) {
-    snprintf(err, err_len,
-             "SVECTOR: rowid storage requires a single-column key (key has %u "
-             "columns)",
-             num_key_parts);
-    return true;
+  // The server packs the whole primary key (all num_key_parts fields) into one
+  // opaque rowid_prefix, folded into a fixed ROWID_MAX-byte trailer. Estimate
+  // the packed upper bound: the sum of the parts' max lengths plus the server's
+  // record-format framing (a physical-record header, a per-part length byte, and
+  // the 2-byte header-length prefix). This over-estimates slightly, which is
+  // safe for a fits/doesn't-fit gate.
+  constexpr uint32_t REC_HEADER_ESTIMATE = 8;
+  constexpr uint32_t HEADER_LEN_PREFIX = 2;
+  uint32_t packed_max = REC_HEADER_ESTIMATE + HEADER_LEN_PREFIX;
+  for (uint32_t i = 0; i < num_key_parts; ++i) {
+    packed_max += part_max_lens[i] + 1;  // + per-part length byte
   }
-  // That single part's value is folded into a fixed ROWID_MAX-byte trailer, so
-  // a wider key cannot fit.
-  if (part_max_lens[0] > ROWID_MAX) {
-    snprintf(
-        err, err_len,
-        "SVECTOR: rowid storage requires a key of at most %u bytes (key is "
-        "up to %u bytes)",
-        ROWID_MAX, part_max_lens[0]);
+  if (packed_max > ROWID_MAX) {
+    snprintf(err, err_len,
+             "SVECTOR: rowid storage requires a primary key that packs to at "
+             "most %u bytes (this key packs to up to %u bytes)",
+             ROWID_MAX, packed_max);
     return true;
   }
   return false;
@@ -132,7 +132,7 @@ bool ColumnStorage::insert(Ctx *storage, MtrCtx::Ref mctx,
     return true;
   }
 
-  // Pack [vector][rowid_len:1][rowid:ROWID_MAX] into one opaque record. The
+  // Pack [vector][rowid_len:2][rowid:ROWID_MAX] into one opaque record. The
   // trailer is zero-padded past the actual rowid so every record is the same
   // fixed size the engine was created with. Assembled in a local buffer (insert
   // is not the hot path -- search/distance is), so no shared state and no data
@@ -145,7 +145,9 @@ bool ColumnStorage::insert(Ctx *storage, MtrCtx::Ref mctx,
   unsigned char *p = record.data();
   memcpy(p, col_data.data, col_data.length);
   p += col_data.length;
-  *p++ = static_cast<unsigned char>(rowid_prefix.length);
+  // rowid_len as 2 bytes, big-endian.
+  *p++ = static_cast<unsigned char>((rowid_prefix.length >> 8) & 0xFF);
+  *p++ = static_cast<unsigned char>(rowid_prefix.length & 0xFF);
   if (rowid_prefix.length > 0)
     memcpy(p, rowid_prefix.data, rowid_prefix.length);
   memset(p + rowid_prefix.length, 0, ROWID_MAX - rowid_prefix.length);
@@ -180,12 +182,13 @@ bool ColumnStorage::select(Ctx *storage, MtrCtx::Ref mctx, Column::Ref col_ref,
   uint16_t vector_len =
       static_cast<uint16_t>(col_data->length - ROWID_TRAILER_LEN);
 
-  // Vector is the leading bytes; trailer follows.
+  // Vector is the leading bytes; trailer follows. rowid_len is 2 bytes,
+  // big-endian, matching insert().
   const unsigned char *trailer = rec + vector_len;
-  uint8_t rowid_len = trailer[0];
+  uint16_t rowid_len = static_cast<uint16_t>((trailer[0] << 8) | trailer[1]);
 
   col_data->length = vector_len;
-  rowid_prefix->data = trailer + 1;
+  rowid_prefix->data = trailer + ROWID_LEN_BYTES;
   rowid_prefix->length = rowid_len;
   return false;
 }
