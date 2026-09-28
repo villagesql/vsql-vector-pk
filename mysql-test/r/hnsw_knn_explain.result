@@ -17,6 +17,44 @@ EXPLAIN
 -> Limit: 10 row(s)  (cost=0.75 rows=5)
     -> Custom index distance scan on idx_v  (cost=0.75 rows=5)
 
+# --- Same plan via FORMAT=JSON (a distinct plan printer): the custom
+# --- distance scan reports access_type index_distance, no filesort. This
+# --- exercises the JSON explain path for the custom INDEX_DISTANCE_SCAN
+# --- variant, which carries no QUICK_RANGE. Volatile cost/row numbers are
+# --- masked so the plan shape is what is asserted. ---
+EXPLAIN FORMAT=JSON
+SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
+EXPLAIN
+{
+  "query_block": {
+    "select_id": 1,
+    "cost_info": {
+      "cost": "#"
+    },
+    "ordering_operation": {
+      "using_filesort": false,
+      "table": {
+        "table_name": "t",
+        "access_type": "index_distance",
+        "rows": #,
+        "rows": #,
+        "filtered": "100.00",
+        "cost_info": {
+          "cost": "#",
+          "cost": "#",
+          "cost": "#",
+          "data_read_per_join": "#"
+        },
+        "used_columns": [
+          "id",
+          "v"
+        ]
+      }
+    }
+  }
+}
+Warnings:
+Note	1003	/* select#1 */ select `test`.`t`.`id` AS `id` from `test`.`t` order by vsql_vector.l2_distance(`test`.`t`.`v`,'[1,2,3,4]') limit 10
 # --- Result: nearest-first order 1, 5, 3, 2, 4 (not --sorted_result: the
 # --- order the plan produces is itself part of what is verified) ---
 SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
