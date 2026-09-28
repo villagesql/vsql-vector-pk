@@ -38,6 +38,15 @@ INSERT INTO t VALUES (5, '[2,2,3,4]');
 EXPLAIN FORMAT=TREE
   SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
 
+--echo # --- Same plan via FORMAT=JSON (a distinct plan printer): the custom
+--echo # --- distance scan reports access_type index_distance, no filesort. This
+--echo # --- exercises the JSON explain path for the custom INDEX_DISTANCE_SCAN
+--echo # --- variant, which carries no QUICK_RANGE. Volatile cost/row numbers are
+--echo # --- masked so the plan shape is what is asserted. ---
+--replace_regex /"[a-z_]+cost[a-z_]*": "[0-9.e+-]+"/"cost": "#"/ /"rows[a-z_]*": [0-9.e+-]+/"rows": #/ /"data_read_per_join": "[0-9A-Za-z ]+"/"data_read_per_join": "#"/
+EXPLAIN FORMAT=JSON
+  SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
+
 --echo # --- Result: nearest-first order 1, 5, 3, 2, 4 (not --sorted_result: the
 --echo # --- order the plan produces is itself part of what is verified) ---
 SELECT id FROM t ORDER BY L2_DISTANCE(v, '[1,2,3,4]') LIMIT 10;
