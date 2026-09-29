@@ -276,7 +276,51 @@ std::pair<bool, bool> DataPage::get_record_status(Page &data_page,
       (bitmap_byte >> (bitmap_bit_offset + DELETE_MARK_BIT)) & 1;
   bool is_allocated = (bitmap_byte >> (bitmap_bit_offset + FREE_BIT)) & 1;
 
-  return std::make_pair(delete_marked, !is_allocated);
+  // A slot is free only in state 00 (both bits clear). A purged slot is 01
+  // (FREE_BIT=0, DELETE_MARK=1): not allocated, but pinned -- not free for
+  // reuse.
+  bool is_free = !is_allocated && !delete_marked;
+
+  return std::make_pair(delete_marked, is_free);
+}
+
+bool DataPage::is_record_purged(Page &data_page, uint16_t slot_index) const {
+  assert(data_page.is_loaded(Page::Latch::EXCLUSIVE) ||
+         data_page.is_loaded(Page::Latch::SHARED));
+
+  Page::Offset bitmap_byte_offset =
+      FREE_BITMAP_OFF + ((slot_index * BITS_PER_RECORD) >> 3);
+  uint8_t bitmap_bit_offset = (slot_index * BITS_PER_RECORD) & 7;
+  uint8_t bitmap_byte = data_page.read_integer_1(bitmap_byte_offset);
+
+  bool delete_marked =
+      (bitmap_byte >> (bitmap_bit_offset + DELETE_MARK_BIT)) & 1;
+  bool is_allocated = (bitmap_byte >> (bitmap_bit_offset + FREE_BIT)) & 1;
+
+  // Purged == 01: FREE_BIT clear, DELETE_MARK set.
+  return !is_allocated && delete_marked;
+}
+
+void DataPage::set_record_purged(Page &data_page, uint16_t slot_index,
+                                 MtrCtx::Ref mtr) const {
+  assert(data_page.is_loaded(Page::Latch::EXCLUSIVE));
+
+#ifndef NDEBUG
+  auto [delete_marked, is_free] = get_record_status(data_page, slot_index);
+  // Purge follows a delete: the record must be occupied and delete-marked (11).
+  assert(!is_free && delete_marked &&
+         "Can only purge an occupied, delete-marked record");
+#endif // NDEBUG
+
+  Page::Offset bitmap_byte_offset =
+      FREE_BITMAP_OFF + ((slot_index * BITS_PER_RECORD) >> 3);
+  uint8_t bitmap_bit_offset = (slot_index * BITS_PER_RECORD) & 7;
+  uint8_t bitmap_byte = data_page.read_integer_1(bitmap_byte_offset);
+
+  // Clear FREE_BIT, leave DELETE_MARK set -> state 01 (purged, pinned).
+  bitmap_byte &= ~(1 << (bitmap_bit_offset + FREE_BIT));
+
+  data_page.write_integer_1(bitmap_byte_offset, bitmap_byte, mtr);
 }
 
 void DataPage::set_record_delete(Page &data_page, uint16_t slot_index,
@@ -417,24 +461,17 @@ void DataPage::set_record_allocated(Page &data_page, uint16_t slot_index,
 
 bool DataPage::free_bit_in_byte(uint8_t bitmap_byte,
                                 uint8_t &bitmap_bit) const {
-  // Mask to extract all FREE_BITs in a byte: 0b10101010
-  // Each 2-bit group has FREE_BIT at position 1, so we check bits 1, 3, 5, 7
-  constexpr uint8_t FREE_BIT_MASK = 0xAA;  // Binary: 10101010
-
-  // Fast path: If all FREE_BITs are set (all slots occupied), skip this byte
-  if ((bitmap_byte & FREE_BIT_MASK) == FREE_BIT_MASK) {
-    return false;  // All 4 slots in this byte are occupied
-  }
-
-  // At least one free slot exists in this byte, find it
+  // A slot is free only in state 00 (both bits clear). FREE_BIT alone is not
+  // enough: a purged slot is 01 (FREE_BIT=0, DELETE_MARK=1) -- not allocated
+  // but pinned, so it must NOT be handed out for reuse.
   for (uint8_t bit_offset = 0; bit_offset < 8; bit_offset += BITS_PER_RECORD) {
-    // Check FREE_BIT (bit 1 of the 2-bit group): 0 = free, 1 = occupied
-    if (((bitmap_byte >> (bit_offset + FREE_BIT)) & 1) == 0) {
+    bool is_allocated = (bitmap_byte >> (bit_offset + FREE_BIT)) & 1;
+    bool delete_marked = (bitmap_byte >> (bit_offset + DELETE_MARK_BIT)) & 1;
+    if (!is_allocated && !delete_marked) {
       bitmap_bit = bit_offset;
       return true;
     }
   }
-  assert(false);
   return false;
 }
 
@@ -532,7 +569,7 @@ void DataPage::insert(Page &data_page, MtrCtx::Ref mtr, Segment::TrxRef trx_ref,
 }
 
 bool DataPage::purge(Page &data_page, MtrCtx::Ref mtr, uint16_t slot_index,
-                     Segment::TrxRef trx_ref, bool &purged) {
+                     Segment::TrxRef trx_ref, bool &purged, bool pin) {
   assert(data_page.is_loaded(Page::Latch::EXCLUSIVE));
 
   // Initialize output parameter
@@ -552,6 +589,12 @@ bool DataPage::purge(Page &data_page, MtrCtx::Ref mtr, uint16_t slot_index,
     return false;
   }
 
+  // Lazy-delete (pin) re-attempt: the slot may already be purged (01) from an
+  // earlier call; nothing more to do.
+  if (pin && is_record_purged(data_page, slot_index)) {
+    return false;
+  }
+
   // Step 3: Verify that the transaction reference matches
   Page::Offset rec_offset = get_record_offset(slot_index);
   Segment::TrxRef stored_trx_ref = data_page.read_integer_8(rec_offset);
@@ -563,16 +606,30 @@ bool DataPage::purge(Page &data_page, MtrCtx::Ref mtr, uint16_t slot_index,
     return false;
   }
 
-  // Step 4: Mark record as free (clears both FREE_BIT and DELETE_MARK_BIT)
-  if (!delete_marked) {
-    // Rollback path: purging a non-deleted slot.
-  }
-  set_record_free(data_page, slot_index, mtr);
+  if (pin) {
+    // Lazy delete: transition to purged (01) -- pinned, not free. The vector
+    // stays resident because the graph still references it; it is reclaimed
+    // only when the graph releases the node. Do NOT touch NUM_FREE_RECS: a
+    // purged slot is not free and must not count as reusable capacity. See
+    // docs/lazy_delete.md.
+    //
+    // Only a delete-marked record (11) may be pinned. Purging clears FREE_BIT,
+    // so pinning a non-deleted record (10) would clear it to 00 = free -- the
+    // opposite of pinning. Purge always follows a committed delete, so this
+    // holds.
+    if (!delete_marked) {
+      return false;
+    }
+    set_record_purged(data_page, slot_index, mtr);
+  } else {
+    // Step 4: Mark record as free (clears both FREE_BIT and DELETE_MARK_BIT)
+    set_record_free(data_page, slot_index, mtr);
 
-  // Step 5: Increment the number of free records
-  uint16_t num_free_recs = data_page.read_integer_2(NUM_FREE_RECS_OFF);
-  num_free_recs++;
-  data_page.write_integer_2(NUM_FREE_RECS_OFF, num_free_recs, mtr);
+    // Step 5: Increment the number of free records
+    uint16_t num_free_recs = data_page.read_integer_2(NUM_FREE_RECS_OFF);
+    num_free_recs++;
+    data_page.write_integer_2(NUM_FREE_RECS_OFF, num_free_recs, mtr);
+  }
 
   // Step 6: Set output parameter to indicate successful purge
   purged = true;

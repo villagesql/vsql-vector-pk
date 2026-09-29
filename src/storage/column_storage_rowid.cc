@@ -201,8 +201,13 @@ bool ColumnStorage::mark_delete(Ctx *storage, MtrCtx::Ref mctx,
 bool ColumnStorage::purge(Ctx *storage, MtrCtx::Ref mctx,
                           Segment::TrxRef trx_ref, Column::Ref col_ref,
                           char *error_msg, uint32_t error_msg_len) {
+  // Lazy delete, step 1: pin the record (mark it purged) instead of freeing it.
+  // The vector must stay resident -- the HNSW graph still references it (both
+  // as a routing waypoint and as the target it will later discover as purged).
+  // The slot is reclaimed only when the graph releases the node, not here.
+  // Hence pin=true. See docs/lazy_delete.md.
   return storage->user()->m_stores[0].purge(mctx, trx_ref, col_ref, error_msg,
-                                            error_msg_len);
+                                            error_msg_len, /*pin=*/true);
 }
 
 } // namespace svector

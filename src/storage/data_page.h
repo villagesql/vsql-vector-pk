@@ -63,8 +63,22 @@ public:
   static constexpr uint8_t MIN_FREE_PERCENT_FOR_FREE_LIST = 20;
 
   // Bitmap bit usage (2 bits per record):
-  // - Bit 0: Delete mark (0 = active , 1 = deleted)
-  // - Bit 1: Free (0 = free slot, 1 = occupied)
+  // - Bit 0: Delete mark
+  // - Bit 1: Free (0 = free/unallocated, 1 = occupied)
+  //
+  // The two bits encode four states (FREE_BIT, DELETE_MARK_BIT):
+  //   00  free       -- unallocated slot, reusable
+  //   10  live       -- occupied, not deleted
+  //   11  deleted    -- occupied, delete-marked (a delete may still be visible
+  //                     to an older read view)
+  //   01  purged     -- InnoDB purge has reclaimed the row (MVCC-safe: no read
+  //                     view can see it), but the slot is PINNED, not free: the
+  //                     HNSW graph still references the vector. The `01`
+  //                     combination was previously unused; lazy delete reuses
+  //                     it so no extra bit / on-disk format change is needed. A
+  //                     purged slot is NOT reusable -- only physical graph-node
+  //                     removal returns it to free (`00`). See
+  //                     docs/lazy_delete.md.
   static constexpr uint8_t DELETE_MARK_BIT = 0;
   static constexpr uint8_t FREE_BIT = 1;
   static constexpr uint8_t BITS_PER_RECORD = 2;
@@ -202,10 +216,24 @@ public:
   bool needs_add_to_free_list(Page &data_page, bool pre_purge = false) const;
 
   // Get the delete mark and free status for a record.
-  // Returns pair<delete_marked, is_free>
+  // Returns pair<delete_marked, is_free>. is_free is true only for a fully free
+  // slot (both bits 0); a purged slot (01) is NOT free -- use is_record_purged.
   // The page must be latched (S or X).
   std::pair<bool, bool> get_record_status(Page &data_page,
                                           uint16_t slot_index) const;
+
+  // Whether a record is in the purged (01) state: MVCC-safe to remove but
+  // pinned (still referenced by the graph, not reusable). See lazy delete.
+  // The page must be latched (S or X).
+  bool is_record_purged(Page &data_page, uint16_t slot_index) const;
+
+  // Mark a record purged (01): clear FREE_BIT, keep DELETE_MARK set. Lazy
+  // delete: InnoDB purge marks the record purged instead of freeing it, so the
+  // graph can later discover it. The slot stays pinned (find_free_slot skips
+  // it) until the graph releases it via set_record_free. The page must be X
+  // latched.
+  void set_record_purged(Page &data_page, uint16_t slot_index,
+                         MtrCtx::Ref mtr) const;
 
   // Set the delete mark bit for a record (mark as deleted).
   // The page must be X latched.
@@ -221,15 +249,23 @@ public:
   void insert(Page &data_page, MtrCtx::Ref mtr, Segment::TrxRef trx_ref,
               Column::Data col_data, Column::Ref &col_ref);
 
-  // Purge a record from the data page (physically remove it).
+  // Purge a record from the data page.
   // The page must be X latched.
   // Only purges if the record's stored trx_ref matches the input trx_ref.
   // Sets purged to true if the record was purged, false otherwise.
   // Returns false on success, true on error.
+  //
+  // pin=false (default): physically free the slot (state 00) and bump the
+  //   free-record count -- the slot becomes reusable.
+  // pin=true (lazy delete): transition the delete-marked record to the purged
+  //   (01) state instead -- MVCC-safe to remove but pinned (the graph still
+  //   references the vector). Does not free the slot, touch the free-record
+  //   count, or make it reusable; the slot is reclaimed later when the graph
+  //   releases the node. See docs/lazy_delete.md.
   bool purge(Page &data_page, MtrCtx::Ref mtr, uint16_t slot_index,
-             Segment::TrxRef trx_ref, bool &purged);
+             Segment::TrxRef trx_ref, bool &purged, bool pin = false);
 
- private:
+private:
   // Set the free bit for a record (mark as free/unallocated).
   // The page must be X latched.
   void set_record_free(Page &data_page, uint16_t slot_index,

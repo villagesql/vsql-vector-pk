@@ -781,7 +781,7 @@ bool ColumnStore::mark_delete(MtrCtx::Ref mctx, Segment::TrxRef trx_ref,
 
 bool ColumnStore::purge(MtrCtx::Ref mctx, Segment::TrxRef trx_ref,
                         Column::Ref col_ref, char *error_msg,
-                        uint32_t error_msg_len) {
+                        uint32_t error_msg_len, bool pin) {
   // Step 1: Decode column reference to get page and slot
   Page::Ref data_page_ref;
   uint16_t slot_index;
@@ -799,8 +799,12 @@ bool ColumnStore::purge(MtrCtx::Ref mctx, Segment::TrxRef trx_ref,
     return true;
   }
 
-  // Step 4: Check if page will need to be added to free list after purge
-  bool need_pessimistic = m_data.needs_add_to_free_list(data_page, true);
+  // Step 4: Check if page will need to be added to free list after purge. A pin
+  // (lazy delete) never frees the slot, so the page can never become
+  // free-listable
+  // -- skip the pessimistic root-page dance entirely.
+  bool need_pessimistic =
+      !pin && m_data.needs_add_to_free_list(data_page, true);
   Page root_page;
 
   // Step 5: If page needs to be added to free list, follow pessimistic path
@@ -829,9 +833,10 @@ bool ColumnStore::purge(MtrCtx::Ref mctx, Segment::TrxRef trx_ref,
     }
   }
 
-  // Step 6: Purge the record
+  // Step 6: Purge the record (pin=true marks it purged/pinned instead of
+  // freeing)
   bool purged = false;
-  if (m_data.purge(data_page, mtr, slot_index, trx_ref, purged)) {
+  if (m_data.purge(data_page, mtr, slot_index, trx_ref, purged, pin)) {
     char info[64];
     snprintf(info, sizeof(info), "purge: failed on page %u slot %u",
              data_page_ref, slot_index);

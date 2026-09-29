@@ -120,8 +120,12 @@ struct ColumnStore {
                    Column::Ref col_ref, bool delete_mark, char *error_msg,
                    uint32_t error_msg_len);
 
+  // Purge a record. pin=false frees the slot (and may return its page to the
+  // free list). pin=true (lazy delete) marks the record purged/pinned instead:
+  // it never frees the slot or touches the free list, so the graph keeps
+  // referencing the vector until it releases the node. See docs/lazy_delete.md.
   bool purge(MtrCtx::Ref mctx, Segment::TrxRef trx_ref, Column::Ref col_ref,
-             char *error_msg, uint32_t error_msg_len);
+             char *error_msg, uint32_t error_msg_len, bool pin = false);
 
   // Overwrites this store's metadata in the root page in place. metadata
   // must be the same length as the metadata this store was created/loaded
