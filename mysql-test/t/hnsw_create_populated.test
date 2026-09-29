@@ -1,18 +1,14 @@
 # CREATE INDEX ... USING EXTENDED(hnsw) on a table that already contains rows.
 #
-# Building the HNSW index over existing data is not supported yet: the bulk-DDL
-# builder has no source index to re-fetch the vector payload from. This must fail
-# with a clean SQL error, NOT crash the server on the first row.
+# The bulk-DDL builder scans the clustered index and inserts each existing row
+# into the HNSW index, so the index is built over the pre-existing data. A KNN
+# query afterwards returns those rows, proving they were indexed.
 #
 # Covers:
-#   Empty table: standalone CREATE INDEX ... USING EXTENDED succeeds (the row
-#     loop reads nothing, so the unsupported build path is never reached).
-#   Populated table: the same CREATE INDEX is rejected cleanly, server survives.
-#   Supported path: index declared at CREATE TABLE, then rows loaded (INSERT
-#     builds the index incrementally).
-#
-# The extension surfaces its reason to the client (not the error log), so no log
-# suppressions are needed.
+#   Empty table: standalone CREATE INDEX over no rows.
+#   Populated table: CREATE INDEX builds the index over the existing rows, which
+#     are then retrievable by a KNN query.
+#   Incremental path: index declared at CREATE TABLE, rows loaded by INSERT.
 
 SET PERSIST vsql_allow_preview_extensions = ON;
 INSTALL EXTENSION vsql_vector;
@@ -23,18 +19,16 @@ CREATE INDEX idx ON t_empty (v) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t_empty;
 DROP TABLE t_empty;
 
---echo # --- Populated table: standalone CREATE INDEX is rejected, not a crash ---
+--echo # --- Populated table: CREATE INDEX builds the index over existing rows ---
 CREATE TABLE t_full (id INT PRIMARY KEY, v SVECTOR(4) NOT NULL);
 INSERT INTO t_full VALUES (1, '[1.0, 2.0, 3.0, 4.0]'), (2, '[5.0, 6.0, 7.0, 8.0]');
---error ER_VILLAGESQL_GENERIC_ERROR
 CREATE INDEX idx ON t_full (v) USING EXTENDED(hnsw);
 
---echo # --- Server survived: CREATE INDEX was rejected, so t_full has no custom
---echo #     index; a plain scan still works and the rows are intact ---
-SELECT COUNT(*) AS rows_after_rejected_create FROM t_full;
+--echo # --- The pre-existing rows are in the index: a KNN query returns them ---
+SELECT id FROM t_full ORDER BY L2_DISTANCE(v, '[1.0, 2.0, 3.0, 4.0]') LIMIT 2;
 DROP TABLE t_full;
 
---echo # --- Supported path: index at CREATE TABLE, then load rows ---
+--echo # --- Incremental path: index at CREATE TABLE, then load rows ---
 CREATE TABLE t_ok (
   id INT PRIMARY KEY,
   v  SVECTOR(4) NOT NULL,

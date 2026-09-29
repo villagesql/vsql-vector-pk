@@ -40,7 +40,7 @@
 // larger opaque blob.
 //
 // Record layout (opaque to the engine):
-//   [ vector : vector_len ][ rowid_len : 1 ][ rowid : ROWID_MAX ]
+//   [ vector : vector_len ][ rowid_len : 2 ][ rowid : ROWID_MAX ]
 //
 // The vector occupies the leading bytes, so the hot distance path -- which
 // reads a vector via the server's key-data callback, sized to the registered
@@ -57,19 +57,22 @@ public:
   using Ctx = Column::StorageCtx<MultiColumnStore>;
 
   // Maximum rowid_prefix bytes stored per record, and the total trailer size
-  // ([rowid_len:1][rowid:ROWID_MAX]) folded into each record.
+  // ([rowid_len:2][rowid:ROWID_MAX]) folded into each record. The rowid_prefix
+  // is the server's packed row reference (the clustered primary key), so a
+  // composite key is supported -- the extension stores it as opaque bytes.
   // TODO(villagesql-indexing): today this is also the per-record trailer width;
   // make it the upper bound (cap) only, and size each index's trailer to its
   // actual key length so raising ROWID_MAX does not waste space for small keys.
   // See ColumnStorage::create().
-  static constexpr uint8_t ROWID_MAX = 32;
-  static constexpr uint16_t ROWID_TRAILER_LEN = 1 + ROWID_MAX;
+  static constexpr uint16_t ROWID_MAX = 512;
+  static constexpr uint16_t ROWID_LEN_BYTES = 2;
+  static constexpr uint16_t ROWID_TRAILER_LEN = ROWID_LEN_BYTES + ROWID_MAX;
 
   // Whether this storage can faithfully hold the row's clustered key as the
   // rowid_prefix trailer, given the key's shape (@p num_key_parts parts, with
-  // @p part_max_lens[i] the maximum stored length of each part). The trailer
-  // stores a single field up to ROWID_MAX bytes, so a composite key resolves
-  // ambiguously and an oversized one does not fit. Checked at CREATE INDEX so
+  // @p part_max_lens[i] the maximum stored length of each part). The server
+  // packs the whole primary key into one opaque rowid_prefix, so a composite key
+  // is fine; only the packed size must fit ROWID_MAX. Checked at CREATE INDEX so
   // an unsupported key is rejected up front rather than per-row at INSERT.
   // @return false if the key can be stored; true (with @p err set) if not.
   static bool can_store_key(uint32_t num_key_parts,

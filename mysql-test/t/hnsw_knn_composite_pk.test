@@ -1,0 +1,43 @@
+# KNN search over an HNSW (USING EXTENDED) index on a table with a COMPOSITE
+# primary key.
+#
+# The index stores the owning row's whole clustered key (both PK columns, packed)
+# as its row reference. A KNN hit is resolved back to the row by unpacking that
+# reference into the composite primary key and looking it up. This test confirms
+# the round trip end to end: the nearest-neighbor ordering returns the correct
+# rows, identified by their (a, b) primary key.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE docs (
+  a       INT NOT NULL,
+  b       INT NOT NULL,
+  vec     SVECTOR(4) NOT NULL,
+  payload VARCHAR(32),
+  PRIMARY KEY (a, b),
+  INDEX idx_vec (vec hnsw_l2) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+--echo # Rows spanning distinct (a, b) primary keys.
+INSERT INTO docs VALUES (1, 10, '[1.0, 2.0, 3.0, 4.0]', 'one');
+INSERT INTO docs VALUES (1, 20, '[5.0, 6.0, 7.0, 8.0]', 'two');
+INSERT INTO docs VALUES (2, 10, '[9.0, 1.0, 2.0, 3.0]', 'three');
+
+--echo # All rows are present, identified by the composite key.
+SELECT a, b, payload FROM docs FORCE INDEX (PRIMARY) ORDER BY a, b;
+
+--echo # KNN nearest to row (1,20)'s vector returns that row: the composite PK
+--echo # was packed at insert and unpacked to resolve the hit.
+SELECT a, b, payload FROM docs
+  ORDER BY L2_DISTANCE(vec, '[5.0, 6.0, 7.0, 8.0]') LIMIT 1;
+
+--echo # KNN returning several rows: each hit resolves to its correct (a, b) row.
+--sorted_result
+SELECT a, b FROM docs ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]') LIMIT 3;
+
+DROP TABLE docs;
+
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
