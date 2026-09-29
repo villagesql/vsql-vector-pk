@@ -12,18 +12,17 @@ t_empty	CREATE TABLE `t_empty` (
   KEY `idx` (`v` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 DROP TABLE t_empty;
-# --- Populated table: standalone CREATE INDEX is rejected, not a crash ---
+# --- Populated table: CREATE INDEX builds the index over existing rows ---
 CREATE TABLE t_full (id INT PRIMARY KEY, v SVECTOR(4) NOT NULL);
 INSERT INTO t_full VALUES (1, '[1.0, 2.0, 3.0, 4.0]'), (2, '[5.0, 6.0, 7.0, 8.0]');
 CREATE INDEX idx ON t_full (v) USING EXTENDED(hnsw);
-ERROR HY000: CREATE INDEX ... USING EXTENDED on a non-empty table is not supported yet; create the index before loading data.
-# --- Server survived: CREATE INDEX was rejected, so t_full has no custom
-#     index; a plain scan still works and the rows are intact ---
-SELECT COUNT(*) AS rows_after_rejected_create FROM t_full;
-rows_after_rejected_create
+# --- The pre-existing rows are in the index: a KNN query returns them ---
+SELECT id FROM t_full ORDER BY L2_DISTANCE(v, '[1.0, 2.0, 3.0, 4.0]') LIMIT 2;
+id
+1
 2
 DROP TABLE t_full;
-# --- Supported path: index at CREATE TABLE, then load rows ---
+# --- Incremental path: index at CREATE TABLE, then load rows ---
 CREATE TABLE t_ok (
 id INT PRIMARY KEY,
 v  SVECTOR(4) NOT NULL,
