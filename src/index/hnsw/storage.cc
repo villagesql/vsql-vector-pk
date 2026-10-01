@@ -23,11 +23,6 @@
 
 #include "storage.h"
 
-// Self-guards to nothing unless SVECTOR_ROWID_TRAILER is defined; the
-// can_store_key() call below is under the same macro, so no #ifdef is needed
-// here.
-#include "../../storage/column_storage_rowid.h"
-
 #include "graph.h"
 #include "graph_ops.h"
 
@@ -223,8 +218,10 @@ bool Options::parse(const vef_index_param_t *params, uint32_t count,
 
 uint16_t IndexStore::entry_len(LevelStore::LevelId level) const {
   auto max_neighbours = LevelStore::max_neighbours(level, m_num_neighbours);
-  return static_cast<uint16_t>(
-      NeighbourEntry::storage_size(max_neighbours, level.has_lower_level()));
+  // Level 0 carries the inline primary key; upper levels do not.
+  const bool has_pk = (level.value == 0);
+  return static_cast<uint16_t>(NeighbourEntry::storage_size(
+      max_neighbours, level.has_lower_level(), has_pk));
 }
 
 uint16_t IndexStore::overflow_len(LevelStore::LevelId level) const {
@@ -236,10 +233,11 @@ bool LevelStore::insert(MtrCtx::Ref mtr, const NeighbourEntry &entry,
                         Segment::TrxRef trx_ref, ScratchBytes &buffer, NID &out,
                         char *err, uint32_t err_len) {
   const bool has_lower = m_level.has_lower_level();
+  const bool has_pk = (m_level.value == 0);
   const uint32_t max_n = max_neighbours();
   assert(entry.neighbours.size() <= max_n);
 
-  const size_t len = NeighbourEntry::storage_size(max_n, has_lower);
+  const size_t len = NeighbourEntry::storage_size(max_n, has_lower, has_pk);
   assert(buffer.size() >= len);
 
   std::byte *p = buffer.data();
@@ -257,6 +255,31 @@ bool LevelStore::insert(MtrCtx::Ref mtr, const NeighbourEntry &entry,
     }
   }
   write_id48_be(p, entry.overflow.value);
+
+  // Primary key field (level 0 only): [pk_len:1][data:PK_INLINE_MAX], zero-
+  // padded. pk_len <= PK_INLINE_MAX means the key is inline -- data holds that
+  // many bytes from entry.pk_data. pk_len == PkLayout::kSpillMarker means the
+  // key spilled -- data holds entry.pk_spill_ref (a Column::Ref) big-endian.
+  // Written once here; never a partial (chunked) update.
+  if (has_pk) {
+    *p++ = static_cast<std::byte>(entry.pk_len);
+    std::byte *field = p;
+    for (size_t i = 0; i < PK_INLINE_MAX; ++i)
+      field[i] = std::byte{0};
+    if (entry.pk_len == PkLayout::kSpillMarker) {
+      static_assert(sizeof(Column::Ref) <= PK_INLINE_MAX);
+      uint64_t ref = static_cast<uint64_t>(entry.pk_spill_ref);
+      for (int i = PK_INLINE_MAX - 1; i >= 0; --i) {
+        field[i] = static_cast<std::byte>(ref & 0xFF);
+        ref >>= 8;
+      }
+    } else {
+      assert(entry.pk_len <= PK_INLINE_MAX);
+      for (size_t i = 0; i < entry.pk_len; ++i)
+        field[i] = static_cast<std::byte>(entry.pk_data[i]);
+    }
+    p += PK_INLINE_MAX;
+  }
   assert(static_cast<size_t>(p - buffer.data()) == len);
 
   Column::Data col_data{reinterpret_cast<const unsigned char *>(buffer.data()),
@@ -315,11 +338,15 @@ bool LevelStore::update(MtrCtx::Ref mtr, NID id, const NeighbourEntry &entry,
                         ScratchBytes &buffer, ScratchChunkIds &chunk_ids,
                         char *err, uint32_t err_len) {
   const bool has_lower = m_level.has_lower_level();
+  const bool has_pk = (m_level.value == 0);
   const uint32_t max_n = max_neighbours();
   assert(!has(mask, NodeField::LowerLevel) || has_lower);
 
   const uint16_t overflow_idx = neighbour_overflow_chunk();
-  const size_t len = (static_cast<size_t>(overflow_idx) + 1) * CHUNK_SIZE;
+  // ColumnStore::update requires a full-record-length buffer (it writes only
+  // the chunks named below). The record includes the inline pk tail on level 0,
+  // so the buffer must span it even though update never writes the pk.
+  const size_t len = NeighbourEntry::storage_size(max_n, has_lower, has_pk);
   assert(buffer.size() >= len);
 
   size_t num_chunks = 0;
@@ -464,6 +491,25 @@ bool LevelStore::fetch(MtrCtx::Ref mtr, NID id, bool for_update,
   if (has(mask, NodeField::Overflow))
     entry.overflow = NID{read_chunk(neighbour_overflow_chunk())};
 
+  // Primary key field (level 0 only), after the chunked region:
+  // [pk_len:1][data:PK_INLINE_MAX]. For an inline key pk_data points at the key
+  // bytes in-page (the caller copies before the mtr commits); for a spilled key
+  // (pk_len == kSpillMarker) data holds the PK store ref, decoded big-endian
+  // into pk_spill_ref.
+  if (has(mask, NodeField::Pk) && m_level.value == 0) {
+    const std::byte *tail =
+        base + static_cast<size_t>(neighbour_overflow_chunk() + 1) * CHUNK_SIZE;
+    entry.pk_len = static_cast<uint8_t>(tail[0]);
+    const std::byte *field = tail + 1;
+    entry.pk_data = reinterpret_cast<const unsigned char *>(field);
+    if (entry.pk_len == PkLayout::kSpillMarker) {
+      uint64_t ref = 0;
+      for (size_t i = 0; i < PK_INLINE_MAX; ++i)
+        ref = (ref << 8) | static_cast<uint8_t>(field[i]);
+      entry.pk_spill_ref = static_cast<Column::Ref>(ref);
+    }
+  }
+
   return false;
 }
 
@@ -538,6 +584,72 @@ bool LevelStore::resolve_owner(NID nid, Node &out, char *err,
 
   out = Node{nid, entry.owner};
   return false;
+}
+
+bool IndexStore::read_pkey(NID nid,
+                           std::vector<std::vector<unsigned char>> &out_parts,
+                           char *err, uint32_t err_len) {
+  LevelStore *level0 = get_level(LevelStore::LevelId{0});
+  if (level0 == nullptr) {
+    snprintf(err, err_len, "HNSW: read_pkey: level 0 not loaded");
+    return true;
+  }
+
+  // Read the node's pk field, then (for a spilled key) the PK store record it
+  // references, both under one mtr. Holding the node record's page latch across
+  // the PK store fetch keeps the pair atomic against a concurrent purge, which
+  // frees the node and its PK record together: the latch bars the purge from
+  // slipping in and freeing (and reusing) the PK record between the two reads.
+  NeighbourEntry entry;
+  size_t num_valid;
+  MtrCtx mtr_ctx;
+  auto mtr = mtr_ctx.start();
+  bool failed = level0->fetch(mtr, nid, /*for_update=*/false, entry, num_valid,
+                              err, err_len, NodeField::Pk);
+  if (!failed) {
+    if (entry.pk_len == PkLayout::kSpillMarker) {
+      ColumnStore &pk_store = m_multi_store.m_stores[S_PK_STORE_INDEX];
+      Column::Data col_data;
+      Column::Data rowid_prefix;
+      Segment::TrxRef trx_ref;
+      bool delete_marked = false;
+      failed = pk_store.fetch(mtr, entry.pk_spill_ref, /*for_update=*/false,
+                              col_data, rowid_prefix, trx_ref, delete_marked,
+                              err, err_len);
+      if (!failed)
+        m_pk_layout.unpack(col_data.data, out_parts);
+    } else {
+      // pk_data points in-page; copy before the mtr commits.
+      out_parts.assign(1, std::vector<unsigned char>(
+                              entry.pk_data, entry.pk_data + entry.pk_len));
+    }
+  }
+  mtr_ctx.commit();
+  return failed;
+}
+
+bool IndexStore::write_spilled_pkey(Segment::TrxRef trx_ref,
+                                    const std::vector<unsigned char> &packed,
+                                    Column::Ref &out_ref, char *err,
+                                    uint32_t err_len) {
+  // Own mtr, released before the caller latches the node that will reference
+  // this record: the insert path must never hold the PK store and node pages
+  // latched at once, or it would latch them in the opposite order from the read
+  // and purge paths (node then PK) and could deadlock. See create_node().
+  ColumnStore &pk_store = m_multi_store.m_stores[S_PK_STORE_INDEX];
+  Column::Data col_data{packed.data(), static_cast<uint32_t>(packed.size())};
+  MtrCtx mtr_ctx;
+  auto mtr = mtr_ctx.start();
+  bool failed = pk_store.insert(mtr, trx_ref, col_data, out_ref, err, err_len);
+  mtr_ctx.commit();
+  return failed;
+}
+
+bool IndexStore::purge_spilled_pkey(MtrCtx::Ref mtr, Column::Ref ref,
+                                    Segment::TrxRef trx_ref, char *err,
+                                    uint32_t err_len) {
+  ColumnStore &pk_store = m_multi_store.m_stores[S_PK_STORE_INDEX];
+  return pk_store.purge(mtr, trx_ref, ref, err, err_len);
 }
 
 LevelStore *IndexStore::locate(NID nid, StoreKind &kind, char *err,
@@ -657,10 +769,26 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
         .encode(&meta);
     specs.push_back({overflow_len(level), std::move(meta)});
   }
+
+  // When the primary key spills, a final fixed-width store (at
+  // S_PK_STORE_INDEX) holds the packed keys. Its root page, like every
+  // non-level-0 store, is allocated lazily on first use (IndexStore::create for
+  // a fresh index, init_root_page below). Omitted entirely for an inlined key.
+  if (!m_pk_layout.inlined) {
+    assert(specs.size() == S_PK_STORE_INDEX);
+    std::string meta;
+    StorageMeta{"HNSW-PK", LevelStore::LevelId{0}, LevelStore::LevelId{0}, {}}
+        .encode(&meta);
+    assert(m_pk_layout.record_bytes <= PkLayout::kMaxSpillRecordLen);
+    specs.push_back(
+        {static_cast<uint16_t>(m_pk_layout.record_bytes), std::move(meta)});
+  }
 }
 
-bool IndexStore::create(Space::Ref space_ref, Segment::TrxRef trx_ref,
-                        const Options &opts, char *err, uint32_t err_len) {
+bool IndexStore::create(const PkLayout &pk_layout, Space::Ref space_ref,
+                        Segment::TrxRef trx_ref, const Options &opts, char *err,
+                        uint32_t err_len) {
+  m_pk_layout = pk_layout;
   m_num_neighbours = opts.M;
   m_ef_construction = opts.ef_construction;
   m_level_norm_factor = 1.0 / std::log(static_cast<double>(opts.M));
@@ -681,6 +809,14 @@ bool IndexStore::create(Space::Ref space_ref, Segment::TrxRef trx_ref,
                                    err_len))
     return true;
 
+  // PK store root page (spilled keys only): allocated from segment 0 like the
+  // rest of the level-0 stores. Created up front, not lazily, so an insert can
+  // write a spilled key without having to format it first.
+  if (!m_pk_layout.inlined &&
+      m_multi_store.init_root_page(static_cast<uint8_t>(SegmentIndex::Primary),
+                                   S_PK_STORE_INDEX, err, err_len))
+    return true;
+
   m_levels[0].emplace(LevelStore::LevelId{0}, m_multi_store.m_stores[0],
                       m_multi_store.m_stores[1], opts.M);
   m_initialized = true;
@@ -691,8 +827,9 @@ bool IndexStore::drop(Segment::TrxRef trx_ref, char *err, uint32_t err_len) {
   return m_multi_store.drop(trx_ref, err, err_len);
 }
 
-bool IndexStore::load(Index::StorageRef storage_ref, const Options &opts,
-                      char *err, uint32_t err_len) {
+bool IndexStore::load(const PkLayout &pk_layout, Index::StorageRef storage_ref,
+                      const Options &opts, char *err, uint32_t err_len) {
+  m_pk_layout = pk_layout;
   m_num_neighbours = opts.M;
   m_ef_construction = opts.ef_construction;
   m_level_norm_factor = 1.0 / std::log(static_cast<double>(opts.M));
@@ -752,28 +889,35 @@ bool IndexStore::load(Index::StorageRef storage_ref, const Options &opts,
   return false;
 }
 
+// The PkLayout for index's primary key: a single column that fits PK_INLINE_MAX
+// is stored inline on the level-0 node, anything larger or composite is packed
+// into the PK store. Derived identically at create and load, since it depends
+// only on the key's fixed shape.
+static PkLayout pk_layout_for(const Index &index) {
+  const uint32_t num_parts = index.get_primary_num_key_cols();
+  std::vector<uint32_t> part_max(num_parts);
+  for (uint32_t i = 0; i < num_parts; ++i)
+    part_max[i] = index.get_primary_max_col_len(i);
+  return PkLayout::from_key(num_parts, part_max.data());
+}
+
 bool create(StorageCtx *ctx, const Index &index, Space::Ref space_ref,
             Segment::TrxRef trx_ref, char *err, uint32_t err_len) {
-#ifdef SVECTOR_ROWID_TRAILER
-  // Colocated row resolution (HAS_COLUMN_REF) stores the row's clustered key as
-  // the rowid_prefix alongside the vector, so a col_ref hit resolves back to
-  // its row. Whether the column storage can hold a given key is the storage's
-  // own concern; describe the key (parts and per-part max length) and let it
-  // decide, rejecting an unsupported key here at CREATE INDEX rather than
-  // per-row at INSERT.
-  const uint32_t num_key_parts = index.get_primary_num_key_cols();
-  std::vector<uint32_t> part_max_lens(num_key_parts);
-  for (uint32_t i = 0; i < num_key_parts; ++i)
-    part_max_lens[i] = index.get_primary_max_col_len(i);
-  if (svector::ColumnStorage::can_store_key(num_key_parts, part_max_lens.data(),
-                                            err, err_len))
+  // Decide how the owning row's primary key is stored, and reject a key too
+  // large to spill here at CREATE INDEX rather than per-row at INSERT.
+  PkLayout pk_layout = pk_layout_for(index);
+  if (!pk_layout.fits()) {
+    snprintf(err, err_len,
+             "HNSW index primary key is too large: packed key is %u bytes, "
+             "maximum is %u",
+             pk_layout.record_bytes, PkLayout::kMaxSpillRecordLen);
     return true;
-#endif // SVECTOR_ROWID_TRAILER
+  }
 
   const auto *opts = index.options<Options>();
   assert(opts != nullptr);
   auto *store = ctx->user();
-  if (store->create(space_ref, trx_ref, *opts, err, err_len))
+  if (store->create(pk_layout, space_ref, trx_ref, *opts, err, err_len))
     return true;
   ctx->set_ref(store->storage_ref());
   return false;
@@ -788,18 +932,28 @@ bool load(StorageCtx *ctx, const Index &index, Index::StorageRef storage_ref,
           char *err, uint32_t err_len) {
   const auto *opts = index.options<Options>();
   assert(opts != nullptr);
-  return ctx->user()->load(storage_ref, *opts, err, err_len);
+  // The key shape is fixed, so the layout matches the one create() used --
+  // including whether the PK store exists -- so the specs line up with what was
+  // persisted.
+  return ctx->user()->load(pk_layout_for(index), storage_ref, *opts, err,
+                           err_len);
 }
 
 bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
             IndexScanKey::KeyPartData *key_columns,
-            IndexScanKey::KeyPartData * /*pkey_columns*/,
+            IndexScanKey::KeyPartData *pkey_columns,
             IndexScanKey::KeyPartRef *key_ref, char *err, uint32_t err_len) {
   IndexGraph graph(*ctx->user(), index, trx_ref,
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
 
+  // HAS_ROW_REF: the server hands the owning row's primary key in pkey_columns
+  // (one entry per key column). The index stores it on the level-0 node -- an
+  // inline single column directly in the node, a larger or composite key in the
+  // PK store -- to return at scan_fetch.
   IndexGraph::NodeData node_data{key_columns[VECTOR_KEY_POS]};
+  node_data.pkey_parts = pkey_columns;
+  node_data.num_pkey_parts = index.get_primary_num_key_cols();
   Node top_node;
   if (GraphOperations<IndexGraph>(graph).insert(node_data, top_node))
     return true;
@@ -902,7 +1056,7 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
                                                     nodes))
     return true;
 
-  auto *c = new Cursor(std::move(nodes));
+  auto *c = new Cursor(ctx->user(), std::move(nodes));
   *cursor = c;
   *eof = c->eof();
   return false;
@@ -916,13 +1070,25 @@ bool position(Index::Cursor cursor, Index::CursorOp op, bool *eof,
 
 bool fetch(Index::Cursor cursor, Column::Ref *col_refs,
            IndexScanKey::KeyPartData * /*key_columns*/,
-           IndexScanKey::KeyPartData * /*pkey_columns*/, char * /*err*/,
-           uint32_t /*err_len*/) {
-  const Node *node = static_cast<Cursor *>(cursor)->current();
+           IndexScanKey::KeyPartData *pkey_columns, char *err,
+           uint32_t err_len) {
+  auto *c = static_cast<Cursor *>(cursor);
+  const Node *node = c->current();
   assert(node != nullptr);
 
   // vid is the vector's own stable column reference.
   col_refs[VECTOR_KEY_POS] = static_cast<Column::Ref>(node->vid.value);
+
+  // Return the row identity: the primary key stored on this node's level-0
+  // record (inline, or unpacked from the PK store), so the server resolves the
+  // row directly from pkey_columns. Held in the cursor so each {data,len} stays
+  // valid after this callback returns.
+  auto &pkey = c->current_pkey();
+  if (c->store()->read_pkey(node->nid, pkey, err, err_len))
+    return true;
+  for (size_t i = 0; i < pkey.size(); ++i)
+    pkey_columns[i] = IndexScanKey::KeyPartData{
+        pkey[i].data(), static_cast<uint32_t>(pkey[i].size())};
   return false;
 }
 

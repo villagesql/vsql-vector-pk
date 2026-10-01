@@ -176,6 +176,16 @@ using ScratchNIDs = ScratchArray<NID>;
 // Which of a level's two stores a node (or NID) belongs to.
 enum class StoreKind { Neighbour, Overflow };
 
+// The owning row's primary key, carried on the level-0 NeighbourEntry as a
+// fixed [pk_len:1][data:PK_INLINE_MAX] field appended after the chunked region.
+// pk_len <= PK_INLINE_MAX means the key is inline in data (a single column of
+// that many bytes; PK_INLINE_MAX = 8 fits an INT or BIGINT). pk_len ==
+// PkLayout::kSpillMarker means the key is too large or composite to inline and
+// has been packed into a separate PK store; data then holds the Column::Ref of
+// the packed record, big-endian. Written once at insert, read at scan.
+inline constexpr size_t PK_INLINE_MAX = 8;
+inline constexpr size_t PK_FIELD_LEN = 1 + PK_INLINE_MAX;
+
 // A Neighbour entry in HNSW index.
 struct NeighbourEntry {
   // Vector owning this neighbour entry.
@@ -186,11 +196,22 @@ struct NeighbourEntry {
   std::span<Node> neighbours{};
   // Reference to the first overflow entry, if any.
   NID overflow{};
+  // The owning row's primary key (level-0 only), as stored in the node's
+  // [pk_len:1][data:PK_INLINE_MAX] field. For an inline key pk_len is the key
+  // length and pk_data points at the key bytes (up to PK_INLINE_MAX); for a
+  // spilled key pk_len is PkLayout::kSpillMarker and pk_spill_ref is the
+  // Column::Ref of the packed record in the PK store. On a read, pk_data points
+  // into the page buffer -- copy before the mtr commits.
+  uint8_t pk_len{0};
+  const unsigned char *pk_data{nullptr};
+  Column::Ref pk_spill_ref{};
 
+  // has_pk is true only for the level-0 record, which carries the inline key.
   static constexpr size_t storage_size(size_t max_neighbours,
-                                       bool has_lower_level) {
+                                       bool has_lower_level, bool has_pk) {
     return VID::STORAGE_SIZE + (has_lower_level ? NID::STORAGE_SIZE : 0) +
-           max_neighbours * Node::STORAGE_SIZE + NID::STORAGE_SIZE;
+           max_neighbours * Node::STORAGE_SIZE + NID::STORAGE_SIZE +
+           (has_pk ? PK_FIELD_LEN : 0);
   }
 };
 
@@ -201,6 +222,7 @@ enum class NodeField : uint32_t {
   LowerLevel = 1 << 1,
   Neighbours = 1 << 2,
   Overflow = 1 << 3,
+  Pk = 1 << 4,
 };
 
 constexpr NodeField operator|(NodeField a, NodeField b) {
@@ -212,9 +234,12 @@ constexpr bool has(NodeField mask, NodeField field) {
   return (static_cast<uint32_t>(mask) & static_cast<uint32_t>(field)) != 0;
 }
 
-// Every NeighbourEntry field -- the default fetch mask for a full read.
+// Every NeighbourEntry field -- the default fetch mask for a full read. Pk is
+// present only on the level-0 record; like LowerLevel it is read/written only
+// when the record actually carries it.
 constexpr NodeField FieldAll = NodeField::Owner | NodeField::LowerLevel |
-                               NodeField::Neighbours | NodeField::Overflow;
+                               NodeField::Neighbours | NodeField::Overflow |
+                               NodeField::Pk;
 
 // Whether LevelStore::fetch()'s NeighbourEntry overload includes or drops
 // neighbours whose NID has the incoming flag set (Id<NIDTag>::is_incoming())

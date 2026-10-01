@@ -119,8 +119,13 @@ class SvectorPageDump {
        if (parse_hnsw_index_metadata(root_info.storage_metadata_raw, index_meta,
                                      decode_error)) {
          have_index_meta = true;
-         record_kind_ = index_meta.is_overflow() ? HnswRecordKind::Overflow
-                                                 : HnswRecordKind::Neighbour;
+         if (index_meta.is_primary_key()) {
+           record_kind_ = HnswRecordKind::PrimaryKey;
+         } else if (index_meta.is_overflow()) {
+           record_kind_ = HnswRecordKind::Overflow;
+         } else {
+           record_kind_ = HnswRecordKind::Neighbour;
+         }
          has_lower_level_ = index_meta.level > 0;
        }
        // If decoding failed, RootPageParser::display() already warned; fall
@@ -133,6 +138,11 @@ class SvectorPageDump {
        if (!have_index_meta) {
          std::cerr << "Error: --graph requires -i/--index with root page "
                       "metadata that decodes as HNSW StorageMeta\n";
+         return 1;
+       }
+       if (index_meta.is_primary_key()) {
+         std::cerr << "Error: --graph is for a graph store (HNSW-L<n>); the "
+                      "HNSW-PK store holds packed primary keys, not a graph\n";
          return 1;
        }
        render_hnsw_graph(reader, index_meta, root_info.column_size,

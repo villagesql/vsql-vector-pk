@@ -27,7 +27,6 @@
 #include <iomanip>
 #include <iostream>
 
-#include "../column_storage_rowid.h" // ColumnStorage::ROWID_TRAILER_LEN (self-guarded)
 #include "../root_page.h"
 
 namespace svector {
@@ -154,19 +153,9 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
   info.records.clear();
   info.records.reserve(info.max_num_recs);
 
-  // For the SVECTOR base-column store with a rowid trailer, column_size is the
-  // inflated record payload (vector + [rowid_len:1][rowid:ROWID_MAX]); the
-  // leading bytes are the vector. Recover the vector length so the trailing
-  // trailer bytes are not mis-decoded as extra float dimensions.
-#ifdef SVECTOR_ROWID_TRAILER
-  const uint16_t rowid_trailer_len = svector::ColumnStorage::ROWID_TRAILER_LEN;
-  const uint32_t vector_bytes =
-      (index_kind == HnswRecordKind::None && column_size > rowid_trailer_len)
-          ? column_size - rowid_trailer_len
-          : column_size;
-#else
+  // The SVECTOR base-column store keeps the vector as-is, so column_size is the
+  // vector length.
   const uint32_t vector_bytes = column_size;
-#endif
   uint32_t vector_dim = vector_bytes / sizeof(float);
 
   // Derived from column_size the same way the root page's display() does
@@ -217,6 +206,12 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
           off += HNSW_ID_SIZE;
         }
         rec.overflow_nid = read_id48(page_data, off);
+      } else if (index_kind == HnswRecordKind::PrimaryKey) {
+        // Packed primary key: the key shape needed to split it into parts is
+        // not on the root page, so keep the raw column bytes for a hex dump.
+        rec.raw_bytes.reserve(column_size);
+        for (uint32_t j = 0; j < column_size; ++j)
+          rec.raw_bytes.push_back(page_data[off + j]);
       } else {
         // Read vector data (assuming float32 for display)
         rec.vector_data.reserve(vector_dim);
@@ -226,26 +221,6 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
             rec.vector_data.push_back(read_float(page_data, float_offset));
           }
         }
-#ifdef SVECTOR_ROWID_TRAILER
-        // The rowid trailer follows the vector: [rowid_len:1][rowid:ROWID_MAX].
-        // rowid_len is the actual length; the rest is zero padding. The stored
-        // rowid is a single opaque blob (no persisted field boundaries), so it
-        // is recorded as one part; the list form leaves room for N parts later.
-        uint32_t trailer_off = off + vector_bytes;
-        if (trailer_off < page_data.size()) {
-          uint8_t rowid_len = read_uint8(page_data, trailer_off);
-          uint32_t rowid_off = trailer_off + 1;
-          rec.has_rowid = true;
-          std::vector<uint8_t> part;
-          part.reserve(rowid_len);
-          for (uint8_t b = 0; b < rowid_len; ++b) {
-            if (rowid_off + b < page_data.size()) {
-              part.push_back(page_data[rowid_off + b]);
-            }
-          }
-          rec.rowid_parts.push_back(std::move(part));
-        }
-#endif
       }
     } else {
       rec.trx_ref = 0;
@@ -339,9 +314,9 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
         }
         std::cout << "  [" << std::setw(3) << i << "] ";
         std::cout << "Trx ID:" << std::setw(12) << rec.trx_ref;
-        // For the multi-line HNSW records the marker goes on the header line;
-        // for a single-line vector record it reads better at the end (after the
-        // data and rowid), appended below.
+        // For HNSW records (graph nodes, packed keys) the marker goes on the
+        // header line; for a single-line vector record it reads better at the
+        // end (after the data), appended below.
         if (rec.is_deleted && info.index_kind != HnswRecordKind::None) {
           std::cout << " (DELETED)";
         }
@@ -396,6 +371,13 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
             std::cout << format_hnsw_ref(rec.overflow_nid);
           }
           std::cout << "\n";
+        } else if (info.index_kind == HnswRecordKind::PrimaryKey) {
+          std::cout << " PK:[0x";
+          for (uint8_t b : rec.raw_bytes) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0')
+                      << static_cast<int>(b);
+          }
+          std::cout << std::dec << std::setfill(' ') << "]\n";
         } else {
           std::cout << " Data:[";
           for (size_t j = 0; j < rec.vector_data.size(); ++j) {
@@ -405,22 +387,6 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
                       << rec.vector_data[j];
           }
           std::cout << "]";
-          if (rec.has_rowid) {
-            // List form (one part today) so a multi-part key needs no format
-            // change: Rowid:[<hex>] now, Rowid:[<hex>, <hex>, ...] later.
-            std::cout << " Rowid:[";
-            for (size_t p = 0; p < rec.rowid_parts.size(); ++p) {
-              if (p > 0)
-                std::cout << ", ";
-              std::cout << "0x";
-              for (uint8_t b : rec.rowid_parts[p]) {
-                std::cout << std::hex << std::setw(2) << std::setfill('0')
-                          << static_cast<int>(b);
-              }
-              std::cout << std::dec << std::setfill(' ');
-            }
-            std::cout << "]";
-          }
           if (rec.is_deleted) {
             std::cout << " (DELETED)";
           }

@@ -32,6 +32,7 @@ namespace {
 constexpr uint8_t STORAGE_META_VERSION = 1;
 constexpr uint8_t ENTRY_POINT_LEN = 8;
 constexpr char OVERFLOW_NAME_SUFFIX[] = "-OV";
+constexpr char PRIMARY_KEY_NAME[] = "HNSW-PK";
 
 // Mirrors DataPage::SLOT_INDEX_BITS/MAX_SLOT_INDEX: the width of the slot
 // index field packed into bits 32-45 of a Column::Ref.
@@ -44,6 +45,10 @@ bool HnswIndexMetadata::is_overflow() const {
   return name.size() >= suffix_len &&
          name.compare(name.size() - suffix_len, suffix_len,
                       OVERFLOW_NAME_SUFFIX) == 0;
+}
+
+bool HnswIndexMetadata::is_primary_key() const {
+  return name == PRIMARY_KEY_NAME;
 }
 
 bool parse_hnsw_index_metadata(const std::string &raw, HnswIndexMetadata &meta,

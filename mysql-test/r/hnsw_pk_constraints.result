@@ -1,0 +1,63 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+# ===================================================================
+# 1. Composite primary key is supported
+# ===================================================================
+# Composite PK declared with the HNSW index in CREATE TABLE.
+CREATE TABLE t_multi (
+a INT NOT NULL,
+b INT NOT NULL,
+v SVECTOR(4) NOT NULL,
+PRIMARY KEY (a, b),
+INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+SHOW CREATE TABLE t_multi;
+Table	Create Table
+t_multi	CREATE TABLE `t_multi` (
+  `a` int NOT NULL,
+  `b` int NOT NULL,
+  `v` vsql_vector.SVECTOR(4) NOT NULL,
+  PRIMARY KEY (`a`,`b`),
+  KEY `idx_v` (`v` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_multi;
+# Also via CREATE INDEX / ALTER TABLE on an already-composite-PK table.
+CREATE TABLE t_multi (
+a INT NOT NULL,
+b INT NOT NULL,
+v SVECTOR(4) NOT NULL,
+PRIMARY KEY (a, b)
+) ENGINE=InnoDB;
+CREATE INDEX idx_v ON t_multi (v) USING EXTENDED(hnsw);
+DROP INDEX idx_v ON t_multi;
+ALTER TABLE t_multi ADD INDEX idx_v (v) USING EXTENDED(hnsw);
+SHOW CREATE TABLE t_multi;
+Table	Create Table
+t_multi	CREATE TABLE `t_multi` (
+  `a` int NOT NULL,
+  `b` int NOT NULL,
+  `v` vsql_vector.SVECTOR(4) NOT NULL,
+  PRIMARY KEY (`a`,`b`),
+  KEY `idx_v` (`v` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_multi;
+# ===================================================================
+# 2. A larger single-column key is accepted and rows insert
+# ===================================================================
+# A key too wide to hold inline on the node is packed into the PK store;
+# values short and long both round-trip.
+CREATE TABLE t_fit (
+k VARBINARY(64) NOT NULL PRIMARY KEY,
+v SVECTOR(4) NOT NULL,
+INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+INSERT INTO t_fit VALUES (REPEAT(_binary 'x', 8), '[1.0, 2.0, 3.0, 4.0]');
+INSERT INTO t_fit VALUES (REPEAT(_binary 'y', 64), '[5.0, 6.0, 7.0, 8.0]');
+SELECT COUNT(*) AS rows_after_insert FROM t_fit FORCE INDEX (PRIMARY);
+rows_after_insert
+2
+DROP TABLE t_fit;
+# HNSW primary-key support test completed
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

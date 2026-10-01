@@ -34,6 +34,7 @@
 
 #include "../../storage/storage.h"
 #include "hnsw.h"
+#include "pk_layout.h"
 #include <villagesql/preview/index_builder.h>
 
 namespace svector::hnsw {
@@ -76,14 +77,27 @@ struct Options {
 // GraphOperations::search_knn() once and hands the whole (already
 // ascending-by-distance) result to the cursor; position()/fetch() below just
 // walk that fixed vector.
+class IndexStore;
+
 class Cursor {
 public:
-  explicit Cursor(std::vector<Node> nodes)
-      : m_nodes(std::move(nodes)), m_pos(m_nodes.empty() ? EOF_POS : 0) {}
+  Cursor(IndexStore *store, std::vector<Node> nodes)
+      : m_store(store), m_nodes(std::move(nodes)),
+        m_pos(m_nodes.empty() ? EOF_POS : 0) {}
 
   // Node at the current position, or nullptr at eof().
   const Node *current() const {
     return m_pos == EOF_POS ? nullptr : &m_nodes[m_pos];
+  }
+
+  // The index store, for resolving a result node's primary key.
+  IndexStore *store() const { return m_store; }
+
+  // Holds the current hit's primary key parts (one vector per key column) so
+  // each {data,len} the fetch callback hands back stays valid until the next
+  // fetch (the server reads them after the callback returns).
+  std::vector<std::vector<unsigned char>> &current_pkey() {
+    return m_current_pkey;
   }
 
   // Advances per op. A cursor at eof() stays there regardless of op -- there
@@ -107,8 +121,10 @@ public:
 private:
   static constexpr size_t EOF_POS = std::numeric_limits<size_t>::max();
 
+  IndexStore *m_store;
   std::vector<Node> m_nodes;
   size_t m_pos;
+  std::vector<std::vector<unsigned char>> m_current_pkey;
 };
 
 using svector::ColumnStore;
@@ -391,17 +407,23 @@ struct StorageMeta {
 
 class IndexStore {
   static constexpr uint8_t S_MAX_LEVEL = 32;
-  static constexpr size_t S_NUM_STORES = static_cast<size_t>(S_MAX_LEVEL) * 2;
+  // Graph stores (two per level) occupy indices [0, 2*S_MAX_LEVEL). When the
+  // primary key spills (PkLayout::inlined false), one more store holds the
+  // packed keys, at this index.
+  static constexpr size_t S_PK_STORE_INDEX =
+      static_cast<size_t>(S_MAX_LEVEL) * 2;
+  static constexpr size_t S_NUM_STORES = S_PK_STORE_INDEX + 1;
 
 public:
   static constexpr size_t KEY_REF_SIZE = StorageMeta::ENTRY_POINT_LEN;
-  bool create(Space::Ref space_ref, Segment::TrxRef trx_ref,
-              const Options &opts, char *err, uint32_t err_len);
+  bool create(const PkLayout &pk_layout, Space::Ref space_ref,
+              Segment::TrxRef trx_ref, const Options &opts, char *err,
+              uint32_t err_len);
 
   bool drop(Segment::TrxRef trx_ref, char *err, uint32_t err_len);
 
-  bool load(Index::StorageRef storage_ref, const Options &opts, char *err,
-            uint32_t err_len);
+  bool load(const PkLayout &pk_layout, Index::StorageRef storage_ref,
+            const Options &opts, char *err, uint32_t err_len);
 
   Index::StorageRef storage_ref() const { return m_multi_store.m_ref; }
 
@@ -527,6 +549,34 @@ private:
 
   std::array<std::optional<LevelStore>, S_MAX_LEVEL> m_levels;
   MultiColumnStore m_multi_store;
+
+  // How the primary key is stored (inline on the node, or spilled to the PK
+  // store), fixed at create/load from the key shape.
+  PkLayout m_pk_layout;
+
+public:
+  // Resolve the primary key for the level-0 node named by nid into out_parts
+  // (one entry per key part), copied out. For an inlined key the single part
+  // comes from the node field; for a spilled key it is unpacked from the PK
+  // store. Returns true on error (writes err). nid must name a level-0
+  // Neighbour record (the scan returns level-0 result nodes).
+  bool read_pkey(NID nid, std::vector<std::vector<unsigned char>> &out_parts,
+                 char *err, uint32_t err_len);
+
+  // Insert the packed primary key into the PK store (in its own mtr -- see the
+  // impl) under trx, returning its ref. Only valid when the layout spills.
+  bool write_spilled_pkey(Segment::TrxRef trx_ref,
+                          const std::vector<unsigned char> &packed,
+                          Column::Ref &out_ref, char *err, uint32_t err_len);
+
+  // Remove the spilled PK store record at ref, under the caller's mtr and trx.
+  // Paired with a node removal, so the record outlives neither the node that
+  // references it nor an aborted transaction. Only valid when the layout
+  // spills.
+  bool purge_spilled_pkey(MtrCtx::Ref mtr, Column::Ref ref,
+                          Segment::TrxRef trx_ref, char *err, uint32_t err_len);
+
+  const PkLayout &pk_layout() const { return m_pk_layout; }
 };
 
 using StorageCtx = Index::StorageCtx<IndexStore>;

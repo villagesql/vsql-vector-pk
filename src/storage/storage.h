@@ -193,13 +193,10 @@ struct MultiColumnStore {
 // ColumnStorage provides external storage for VECTOR columns.
 // All methods are static and correspond to the VEF storage interface.
 //
-// Two implementations of svector::ColumnStorage exist, selected at compile
-// time. The baseline one below stores the vector as-is and does not retain the
-// rowid_prefix. When SVECTOR_ROWID_TRAILER is defined, this baseline is
-// compiled out and column_storage_rowid.h/.cc provides a ColumnStorage that
-// keeps a rowid trailer for colocated row resolution (REF_LOOKUP). Either way
-// the generic ColumnStore/MultiColumnStore engine underneath is identical.
-#ifndef SVECTOR_ROWID_TRAILER
+// The SVECTOR column-storage adapter: stores the vector as-is. Row identity is
+// owned by the index (stored on the graph node), so this adapter does not
+// retain any rowid. The rowid_prefix parameters on insert/select are part of
+// the generic column-store ABI and are ignored here.
 class ColumnStorage {
  public:
    using Ctx = Column::StorageCtx<MultiColumnStore>;
@@ -233,7 +230,6 @@ class ColumnStorage {
                      Column::Ref col_ref, char *error_msg,
                      uint32_t error_msg_len);
 };
-#endif // !SVECTOR_ROWID_TRAILER
 
 }  // namespace svector
 

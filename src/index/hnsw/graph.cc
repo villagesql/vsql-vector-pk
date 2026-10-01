@@ -29,6 +29,8 @@
 #include <mutex>
 #include <random>
 #include <shared_mutex>
+#include <utility>
+#include <vector>
 
 namespace svector::hnsw {
 
@@ -43,9 +45,10 @@ GraphContext make_graph_context(IndexStore &store, size_t vector_buf_size,
   const uint32_t mmax0 = LevelStore::max_neighbours(LevelStore::LevelId{0}, M);
   const uint32_t overflow_capacity =
       LevelStore::overflow_capacity(LevelStore::LevelId{0}, M);
-  // Level 0 has no lower level, so its NeighbourEntry omits that field.
-  const size_t neighbour_buf_size =
-      NeighbourEntry::storage_size(mmax0, /*has_lower_level=*/false);
+  // Level 0 has no lower level, so its NeighbourEntry omits that field, but it
+  // carries the inline primary key. This buffer sizes the largest record.
+  const size_t neighbour_buf_size = NeighbourEntry::storage_size(
+      mmax0, /*has_lower_level=*/false, /*has_pk=*/true);
   const size_t overflow_buf_size =
       OverflowEntry::storage_size(overflow_capacity);
   return GraphContext(neighbour_buf_size, overflow_buf_size, vector_buf_size,
@@ -379,6 +382,48 @@ bool IndexGraph::create_node(const std::optional<Node> &parent, LevelId level,
   NeighbourEntry entry;
   entry.owner = VID{owner_ref};
   entry.neighbours = neighbours;
+  // The level-0 record carries the owning row's primary key. A key that fits
+  // the inline field is stored there directly; a larger or composite key is
+  // packed into the PK store and the field holds the resulting ref.
+  //
+  // Latch order: the PK record is written in its own mtr (inside
+  // write_spilled_pkey), released before the node mtr below latches the node's
+  // page -- insert never holds the PK-store and node pages latched at once.
+  // This is required, not just tidier: the read and purge paths both latch
+  // node-page then PK-page, so an insert holding PK-page while taking node-page
+  // would latch them in the reverse order and could deadlock against a
+  // concurrent read/purge on the same page pair.
+  //
+  // TODO(villagesql-vsql-vector): a spilled PK record can be orphaned. Because
+  // the write above is a separate mtr (and mtrs have no rollback -- ~MtrCtx
+  // commits), a node insert that fails after it, or a crash between the two,
+  // leaves a committed PK record no node references. It is dead space until the
+  // index is dropped (the segment drop reclaims it). This matches the engine's
+  // existing partial-insert leak stance (levels are likewise never dropped once
+  // created); making the PK record reachable for reclaim needs a background
+  // sweep or a reachability check, not a format change. Accepted for now.
+  std::vector<unsigned char> packed_pk;
+  if (level.value == 0) {
+    const PkLayout &layout = m_store.pk_layout();
+    if (layout.inlined) {
+      assert(data.num_pkey_parts == 1);
+      entry.pk_len = static_cast<uint8_t>(data.pkey_parts[0].length);
+      entry.pk_data = data.pkey_parts[0].data;
+    } else {
+      assert(data.num_pkey_parts == layout.num_parts);
+      std::vector<std::pair<const unsigned char *, uint32_t>> parts(
+          layout.num_parts);
+      for (uint32_t i = 0; i < layout.num_parts; ++i)
+        parts[i] = {data.pkey_parts[i].data, data.pkey_parts[i].length};
+      layout.pack(parts, packed_pk);
+      Column::Ref spill_ref;
+      if (m_store.write_spilled_pkey(m_trx_ref, packed_pk, spill_ref,
+                                     get_err_buffer(), get_err_buffer_len()))
+        return true;
+      entry.pk_len = PkLayout::kSpillMarker;
+      entry.pk_spill_ref = spill_ref;
+    }
+  }
   NID new_nid;
   if (store->insert(mtr, entry, m_trx_ref, m_ctx.m_neighbour_buf, new_nid,
                     get_err_buffer(), get_err_buffer_len()))
@@ -520,6 +565,24 @@ bool IndexGraph::drop_node(const std::optional<Node> &parent, LevelId level,
 
   LevelStore *store = m_store.get_level(level);
   assert(store != nullptr);
+
+  // A spilled primary key has its own PK store record keyed off this level-0
+  // node; free it before the node that references it is removed. Read the ref
+  // from the node's pk field first (the field is level-0 only).
+  if (level.value == 0 && !m_store.pk_layout().inlined) {
+    NeighbourEntry pk_entry;
+    size_t num_valid = 0;
+    // for_update: this fetch takes the node record's page X-latch, which the
+    // store->remove() below re-takes on the same page (an MTR permits repeated
+    // X-latching of a page, but not repeated S-latching -- see graph.h).
+    if (store->fetch(mtr, node.nid, /*for_update=*/true, pk_entry, num_valid,
+                     get_err_buffer(), get_err_buffer_len(), NodeField::Pk))
+      return true;
+    assert(pk_entry.pk_len == PkLayout::kSpillMarker);
+    if (m_store.purge_spilled_pkey(mtr, pk_entry.pk_spill_ref, m_trx_ref,
+                                   get_err_buffer(), get_err_buffer_len()))
+      return true;
+  }
 
   if (store->remove(mtr, StoreKind::Neighbour, node.nid, m_trx_ref,
                     get_err_buffer(), get_err_buffer_len()))
