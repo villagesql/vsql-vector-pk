@@ -4,25 +4,21 @@
 
 An extension for VillageSQL Server that adds a vector data type with external columnar storage (SVECTOR), enabling efficient vector operations and laying the foundation for future ANN search and indexing.
 
-This is `vsql-vector-pk`, a downstream build of vsql-vector that stores the row's primary key in the vector column store so a KNN scan can resolve hits back to full rows (see the note below). It builds and installs as the `vsql_vector` extension.
+This is `vsql-vector-pk`, a downstream build of vsql-vector whose HNSW index owns the owning row's primary key, so a KNN scan can resolve hits back to full rows (see the note below). It builds and installs as the `vsql_vector` extension.
 
 > **This extension is under active development and is not stable.** It depends on [VillageSQL experimental extension APIs](https://villagesql.com/docs/mysql-8.4/0.0.5-dev/extension-api-reference#experimental-apis) that are subject to breaking changes without notice. It is not recommended for production use.
 
-> **Downstream variant — primary key stored in the vector column store.** This is
-> a downstream build of vsql-vector that stores the row's primary key *inside the
-> vector column store*, alongside each vector (a fixed-size "rowid trailer"). This
-> is what lets an HNSW index hit be resolved back to its **full row**, so a KNN
-> scan can return the row's other columns; mainline vsql-vector stores no rowid
-> and cannot do this. This is the variant to use for end-to-end ANN.
+> **Downstream variant — HNSW index owns the row's primary key.** The HNSW index
+> stores the owning row's primary key as part of its own on-disk structure, so an
+> index hit resolves back to its **full row** and a KNN scan can return the row's
+> other columns; mainline vsql-vector stores no row reference and cannot do this.
+> This is the variant to use for end-to-end ANN.
 >
-> Because the key is folded into a fixed-size trailer, the primary key of an
-> HNSW-indexed table is restricted:
->
-> - The primary key must be a **single column** (composite keys are rejected at
->   `CREATE INDEX`). PK-less tables are fine — InnoDB's synthetic 6-byte row id is
->   used.
-> - That single key column must be **at most 32 bytes** (`ROWID_MAX`); wider keys
->   are rejected at `CREATE INDEX`.
+> A small single-column key is held inline on the node; a larger or composite key
+> is packed into a separate per-index primary-key store. Composite (multi-part)
+> primary keys are fully supported, and a primary-key-less table is fine — InnoDB's
+> synthetic row id is used. The only limit is that a key too large to pack
+> (declared max over ~3 KB) is rejected at `CREATE INDEX`.
 
 ## Features
 
@@ -41,7 +37,7 @@ This is `vsql-vector-pk`, a downstream build of vsql-vector that stores the row'
 #### Prerequisites
 - VillageSQL build tree (specified via `VillageSQL_BUILD_DIR`)
 - CMake 3.16 or higher
-- C++17 compatible compiler
+- C++20 compatible compiler
 
 #### Build Instructions
 1. Clone the repository:
@@ -172,9 +168,11 @@ class after the column name (default is L2 if omitted):
 | `hnsw_cosine` | Cosine |
 | `hnsw_inner_product` | Inner product |
 
-Because this variant stores the primary key in the vector column store (see the
-note at the top), the indexed table's primary key must be a **single column of at
-most 32 bytes**, or the table may be primary-key-less.
+The HNSW index stores the owning row's primary key (see the note at the top), so
+an index hit resolves back to its full row. The primary key may be a single
+column or a **composite (multi-part) key**, or the table may be primary-key-less;
+the only restriction is that a key too large to pack (declared max over ~3 KB) is
+rejected at `CREATE INDEX`.
 
 ```sql
 CREATE TABLE docs (
@@ -253,9 +251,10 @@ no B-tree, so any operation that would maintain its entries is rejected with a
 clean error (the server is never crashed); operations that do not touch it are
 allowed:
 
-- **CREATE INDEX** must be run on an **empty table**. `CREATE INDEX ... USING
-  EXTENDED(hnsw)` on a table that already has rows is rejected — declare the
-  index at `CREATE TABLE` and load data afterwards.
+- **CREATE INDEX** is supported on an empty or a **populated** table: `CREATE
+  INDEX ... USING EXTENDED(hnsw)` builds the index over whatever rows already
+  exist, and it can equally be declared at `CREATE TABLE` with data loaded
+  afterwards.
 - **INSERT** is supported; the index is maintained as rows are inserted.
 - **DELETE** of a row is not supported.
 - **UPDATE** that changes the indexed vector column, or the primary key, is not
@@ -293,7 +292,7 @@ The build also produces `svector_page_dump`, a standalone tool for inspecting SV
 
 ### Example: inspecting a data page with delete-marked records
 
-The following example shows output after inserting 5 rows into a `SVECTOR(4)` column and then deleting two of them (rows with id=2 and id=4) before the InnoDB purge thread has run. The delete-marked slots remain physically present in the page until purge.
+The following example shows output after inserting 5 rows into a `SVECTOR(4)` column and then deleting two of them (rows with id=2 and id=4) before the InnoDB purge thread has run. The delete-marked slots remain physically present in the page until purge. The SVECTOR column store holds the vector only; row identity lives in the HNSW index, not here.
 
 ```bash
 $ svector_page_dump embeddings.ibd 4 -d 5 -r
@@ -309,7 +308,7 @@ SVECTOR Root Page
 Version:           1
 Page Type:         1 (ROOT_PAGE)
 Creator:           SVECTOR
-Column Size:       49 bytes (4-dim float vector + 33-byte rowid trailer)
+Column Size:       16 bytes (4-dim float vector)
 
 Data Pages:
   Total:           1
@@ -353,24 +352,23 @@ Record Bitmap:
   (. = Free, A = Active, D = Deleted)
 
 Records (showing from slot 0, up to 10 records):
-  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40] Rowid:[0x80000001]
-  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] Rowid:[0x80000002] (DELETED)
-  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50] Rowid:[0x80000003]
-  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] Rowid:[0x80000004] (DELETED)
-  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44] Rowid:[0x80000005]
+  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40]
+  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] (DELETED)
+  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50]
+  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] (DELETED)
+  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44]
 ```
 
-The `Rowid:[...]` field is the owning row's primary key stored alongside the
-vector (the "rowid trailer"), so an index hit resolves back to its row. It is a
-list to leave room for multi-part keys; today it is always a single element. The
-example values are a single-column `INT` primary key in InnoDB's clustered-key
-byte format (the sign bit is set, so key `1` is `0x80000001`).
+Each record holds the vector and its MVCC transaction id only. The owning row's
+primary key is stored by the HNSW index (inline on a graph node or in the index's
+primary-key store), not in this column store, so an index hit resolves back to
+its row via the index.
 
 Key observations:
 - **`DELETED` records** (slots 1 and 3) are still physically present and visible to concurrent transactions that started before the DELETE committed (MVCC). They are reclaimed by the purge thread once no active transaction can see them.
 - **Record Bitmap** encodes each slot's state in 2 bits: `A` = active (occupied, not deleted), `D` = delete-marked (occupied, pending purge), `.` = free (available for insert).
 - **Free Slot Number `0`** means this data page is tracked at index 0 in the root page's free slot array, making it eligible for the next insert without a root page scan.
-- **Max Records `673`** is the page capacity for `SVECTOR(4)` on a 16 KB InnoDB page: `54 (header) + ⌈673×2/8⌉ (bitmap) + 673×24 (records) + 8 (trailer) = 16383 bytes`.
+- **Max Records `673`** is the page capacity for `SVECTOR(4)` on a 16 KB InnoDB page, where each record is 24 bytes (16-byte vector + 8-byte MVCC trx id): `54 (header) + ⌈673×2/8⌉ (bitmap) + 673×24 (records) + 8 (page trailer) = 16383 bytes`.
 
 ## Development
 
@@ -382,9 +380,8 @@ vsql-vector-pk/
 │   ├── native_vector.cc       # Encoding/decoding implementations
 │   ├── distance_registry.h    # Distance/similarity function registry
 │   ├── vector.cc              # VDF implementations and extension registration
-│   ├── storage/               # SVECTOR column storage (InnoDB-backed)
+│   ├── storage/               # Fixed-size column storage (InnoDB-backed)
 │   │   ├── storage.h/.cc               # Column store engine (fixed-size records)
-│   │   ├── column_storage_rowid.h/.cc  # Rowid-trailer ColumnStorage adapter
 │   │   ├── root_page.h/.cc             # Root page structure and free-slot mgmt
 │   │   ├── data_page.h/.cc             # Data page structure and slot mgmt
 │   │   └── tools/                      # svector_page_dump and its parsers
@@ -398,10 +395,12 @@ vsql-vector-pk/
 │   └── index/
 │       └── hnsw/              # HNSW ANN index implementation
 │           ├── hnsw.h                  # Shared HNSW types/constants
-│           ├── storage.h/.cc           # Index storage (graph levels/nodes)
+│           ├── pk_layout.h             # Primary-key inline/spill layout + packing
+│           ├── storage.h/.cc           # Index storage (graph levels/nodes, PK store)
 │           ├── graph.h/.cc             # Graph structure
 │           ├── graph_ops.h/.cc         # Graph operations (search/insert)
 │           ├── layer_ops.h/.cc         # Per-layer operations
+│           ├── distance_evaluator.h    # Distance-kernel dispatch
 │           └── visibility_policy.h     # MVCC visibility for scans
 ├── cmake/
 │   └── FindVillageSQL.cmake  # CMake module to locate VillageSQL SDK

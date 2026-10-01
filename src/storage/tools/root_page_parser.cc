@@ -200,7 +200,9 @@ void RootPageParser::display(const RootPageInfo &info, bool verbose,
 
   if (has_index_meta) {
     const bool has_lower_level = index_meta.level > 0;
-    if (index_meta.is_overflow()) {
+    if (index_meta.is_primary_key()) {
+      std::cout << " (HNSW packed primary key)";
+    } else if (index_meta.is_overflow()) {
       uint32_t capacity = hnsw_overflow_capacity(info.column_size);
       std::cout << " (HNSW OverflowEntry, capacity " << capacity << ")";
     } else {

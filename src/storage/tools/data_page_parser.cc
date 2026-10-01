@@ -206,6 +206,12 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
           off += HNSW_ID_SIZE;
         }
         rec.overflow_nid = read_id48(page_data, off);
+      } else if (index_kind == HnswRecordKind::PrimaryKey) {
+        // Packed primary key: the key shape needed to split it into parts is
+        // not on the root page, so keep the raw column bytes for a hex dump.
+        rec.raw_bytes.reserve(column_size);
+        for (uint32_t j = 0; j < column_size; ++j)
+          rec.raw_bytes.push_back(page_data[off + j]);
       } else {
         // Read vector data (assuming float32 for display)
         rec.vector_data.reserve(vector_dim);
@@ -308,9 +314,9 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
         }
         std::cout << "  [" << std::setw(3) << i << "] ";
         std::cout << "Trx ID:" << std::setw(12) << rec.trx_ref;
-        // For the multi-line HNSW records the marker goes on the header line;
-        // for a single-line vector record it reads better at the end (after the
-        // data and rowid), appended below.
+        // For HNSW records (graph nodes, packed keys) the marker goes on the
+        // header line; for a single-line vector record it reads better at the
+        // end (after the data), appended below.
         if (rec.is_deleted && info.index_kind != HnswRecordKind::None) {
           std::cout << " (DELETED)";
         }
@@ -365,6 +371,13 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
             std::cout << format_hnsw_ref(rec.overflow_nid);
           }
           std::cout << "\n";
+        } else if (info.index_kind == HnswRecordKind::PrimaryKey) {
+          std::cout << " PK:[0x";
+          for (uint8_t b : rec.raw_bytes) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0')
+                      << static_cast<int>(b);
+          }
+          std::cout << std::dec << std::setfill(' ') << "]\n";
         } else {
           std::cout << " Data:[";
           for (size_t j = 0; j < rec.vector_data.size(); ++j) {
@@ -374,22 +387,6 @@ void DataPageParser::display(const DataPageInfo &info, bool verbose,
                       << rec.vector_data[j];
           }
           std::cout << "]";
-          if (rec.has_rowid) {
-            // List form (one part today) so a multi-part key needs no format
-            // change: Rowid:[<hex>] now, Rowid:[<hex>, <hex>, ...] later.
-            std::cout << " Rowid:[";
-            for (size_t p = 0; p < rec.rowid_parts.size(); ++p) {
-              if (p > 0)
-                std::cout << ", ";
-              std::cout << "0x";
-              for (uint8_t b : rec.rowid_parts[p]) {
-                std::cout << std::hex << std::setw(2) << std::setfill('0')
-                          << static_cast<int>(b);
-              }
-              std::cout << std::dec << std::setfill(' ');
-            }
-            std::cout << "]";
-          }
           if (rec.is_deleted) {
             std::cout << " (DELETED)";
           }

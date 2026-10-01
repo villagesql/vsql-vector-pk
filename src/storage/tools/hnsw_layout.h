@@ -40,9 +40,12 @@ namespace tool {
 // to. A store's kind is recovered from its root page's decoded
 // HnswIndexMetadata::name, not passed in independently.
 enum class HnswRecordKind {
-  None,      // Not an HNSW store; records are plain SVECTOR column data.
-  Neighbour, // svector::hnsw::NeighbourEntry records (the primary store).
-  Overflow,  // svector::hnsw::OverflowEntry records (the overflow store).
+  None,       // Not an HNSW store; records are plain SVECTOR column data.
+  Neighbour,  // svector::hnsw::NeighbourEntry records (the primary store).
+  Overflow,   // svector::hnsw::OverflowEntry records (the overflow store).
+  PrimaryKey, // Packed primary-key records (the spilled-key PK store). Their
+              // framing depends on the index's key shape, which the root page
+              // does not carry, so records are shown as raw bytes.
 };
 
 // On-disk width, in bytes, of a single NID/VID (svector::hnsw::Id<Tag>
@@ -89,6 +92,10 @@ struct HnswIndexMetadata {
   // the primary NeighbourEntry store ("HNSW-L<n>"), per
   // IndexStore::build_storage_specs()'s naming.
   bool is_overflow() const;
+
+  // True when name identifies the primary-key store ("HNSW-PK") holding spilled
+  // packed keys, per IndexStore::build_storage_specs()'s naming.
+  bool is_primary_key() const;
 };
 
 // Decodes a root page's raw storage-metadata bytes (the full metadata_len
