@@ -188,6 +188,12 @@ public:
 
   struct NodeData {
     IndexScanKey::KeyPartData data;
+    // The owning row's primary key, stored on the level-0 node: pkey_parts
+    // points at num_pkey_parts KeyPartData (one per key column), owned by the
+    // caller for the duration of the insert. num_pkey_parts is 0 for internal
+    // node-data used only for distance (query vectors, neighbour resolution).
+    const IndexScanKey::KeyPartData *pkey_parts = nullptr;
+    uint32_t num_pkey_parts = 0;
   };
 
   using Node = hnsw::Node;

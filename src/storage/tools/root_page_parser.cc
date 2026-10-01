@@ -26,7 +26,6 @@
 #include <iomanip>
 #include <iostream>
 
-#include "../column_storage_rowid.h" // ColumnStorage::ROWID_TRAILER_LEN (self-guarded)
 #include "hnsw_layout.h"
 #include "page_reader.h"
 
@@ -212,21 +211,10 @@ void RootPageParser::display(const RootPageInfo &info, bool verbose,
                 << ")";
     }
   } else {
-#ifdef SVECTOR_ROWID_TRAILER
-    // The SVECTOR base-column store inflates each record's column_size by the
-    // fixed rowid trailer ([rowid_len:1][rowid:ROWID_MAX]); the leading bytes
-    // are the vector. Subtract the trailer to recover the vector dimensions.
-    const uint16_t trailer = svector::ColumnStorage::ROWID_TRAILER_LEN;
-    if (info.column_size > trailer && (info.column_size - trailer) % 4 == 0) {
-      std::cout << " (" << ((info.column_size - trailer) / 4)
-                << "-dim float vector + " << trailer << "-byte rowid trailer)";
-    }
-#else
+    // The SVECTOR base-column store keeps the vector as-is.
     if (info.column_size % 4 == 0) {
-      // Calculate vector dimensions (assuming float32)
       std::cout << " (" << (info.column_size / 4) << "-dim float vector)";
     }
-#endif
   }
   std::cout << "\n\n";
 

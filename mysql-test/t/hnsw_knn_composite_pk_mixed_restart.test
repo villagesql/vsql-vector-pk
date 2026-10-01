@@ -1,0 +1,7 @@
+# Variant of hnsw_knn_composite_pk_mixed.test that restarts the server after the
+# rows are inserted and before any KNN query, to verify the on-disk spilled
+# primary keys (the composite keys packed into the PK store) are recovered as
+# expected: after restart the index is reloaded from disk and each KNN hit still
+# resolves to its correct row by its full composite key.
+let $restart = 1;
+--source hnsw_knn_composite_pk_mixed.test

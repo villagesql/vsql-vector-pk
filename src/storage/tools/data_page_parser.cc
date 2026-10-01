@@ -27,7 +27,6 @@
 #include <iomanip>
 #include <iostream>
 
-#include "../column_storage_rowid.h" // ColumnStorage::ROWID_TRAILER_LEN (self-guarded)
 #include "../root_page.h"
 
 namespace svector {
@@ -154,19 +153,9 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
   info.records.clear();
   info.records.reserve(info.max_num_recs);
 
-  // For the SVECTOR base-column store with a rowid trailer, column_size is the
-  // inflated record payload (vector + [rowid_len:1][rowid:ROWID_MAX]); the
-  // leading bytes are the vector. Recover the vector length so the trailing
-  // trailer bytes are not mis-decoded as extra float dimensions.
-#ifdef SVECTOR_ROWID_TRAILER
-  const uint16_t rowid_trailer_len = svector::ColumnStorage::ROWID_TRAILER_LEN;
-  const uint32_t vector_bytes =
-      (index_kind == HnswRecordKind::None && column_size > rowid_trailer_len)
-          ? column_size - rowid_trailer_len
-          : column_size;
-#else
+  // The SVECTOR base-column store keeps the vector as-is, so column_size is the
+  // vector length.
   const uint32_t vector_bytes = column_size;
-#endif
   uint32_t vector_dim = vector_bytes / sizeof(float);
 
   // Derived from column_size the same way the root page's display() does
@@ -226,26 +215,6 @@ bool DataPageParser::parse(const std::vector<uint8_t> &page_data,
             rec.vector_data.push_back(read_float(page_data, float_offset));
           }
         }
-#ifdef SVECTOR_ROWID_TRAILER
-        // The rowid trailer follows the vector: [rowid_len:1][rowid:ROWID_MAX].
-        // rowid_len is the actual length; the rest is zero padding. The stored
-        // rowid is a single opaque blob (no persisted field boundaries), so it
-        // is recorded as one part; the list form leaves room for N parts later.
-        uint32_t trailer_off = off + vector_bytes;
-        if (trailer_off < page_data.size()) {
-          uint8_t rowid_len = read_uint8(page_data, trailer_off);
-          uint32_t rowid_off = trailer_off + 1;
-          rec.has_rowid = true;
-          std::vector<uint8_t> part;
-          part.reserve(rowid_len);
-          for (uint8_t b = 0; b < rowid_len; ++b) {
-            if (rowid_off + b < page_data.size()) {
-              part.push_back(page_data[rowid_off + b]);
-            }
-          }
-          rec.rowid_parts.push_back(std::move(part));
-        }
-#endif
       }
     } else {
       rec.trx_ref = 0;

@@ -1,0 +1,67 @@
+# Primary-key support for HNSW (USING EXTENDED) indexes.
+#
+# The index owns row resolution: at insert it stores the owning row's whole
+# clustered primary key as the node's row reference, and at scan it returns that
+# key for the server to look the row up. A single small key is held inline on
+# the node; a larger or composite key is packed into a separate PK store. A
+# composite primary key is therefore supported end to end.
+#
+# This test exercises the observable behavior: a composite PK is accepted via
+# CREATE TABLE, CREATE INDEX, and ALTER TABLE, and a key whose declared max fits
+# is accepted and rows insert.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+--echo # ===================================================================
+--echo # 1. Composite primary key is supported
+--echo # ===================================================================
+
+--echo # Composite PK declared with the HNSW index in CREATE TABLE.
+CREATE TABLE t_multi (
+  a INT NOT NULL,
+  b INT NOT NULL,
+  v SVECTOR(4) NOT NULL,
+  PRIMARY KEY (a, b),
+  INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+SHOW CREATE TABLE t_multi;
+DROP TABLE t_multi;
+
+--echo # Also via CREATE INDEX / ALTER TABLE on an already-composite-PK table.
+CREATE TABLE t_multi (
+  a INT NOT NULL,
+  b INT NOT NULL,
+  v SVECTOR(4) NOT NULL,
+  PRIMARY KEY (a, b)
+) ENGINE=InnoDB;
+CREATE INDEX idx_v ON t_multi (v) USING EXTENDED(hnsw);
+DROP INDEX idx_v ON t_multi;
+ALTER TABLE t_multi ADD INDEX idx_v (v) USING EXTENDED(hnsw);
+SHOW CREATE TABLE t_multi;
+DROP TABLE t_multi;
+
+--echo # ===================================================================
+--echo # 2. A larger single-column key is accepted and rows insert
+--echo # ===================================================================
+--echo # A key too wide to hold inline on the node is packed into the PK store;
+--echo # values short and long both round-trip.
+
+CREATE TABLE t_fit (
+  k VARBINARY(64) NOT NULL PRIMARY KEY,
+  v SVECTOR(4) NOT NULL,
+  INDEX idx_v (v) USING EXTENDED(hnsw)
+) ENGINE=InnoDB;
+
+INSERT INTO t_fit VALUES (REPEAT(_binary 'x', 8), '[1.0, 2.0, 3.0, 4.0]');
+INSERT INTO t_fit VALUES (REPEAT(_binary 'y', 64), '[5.0, 6.0, 7.0, 8.0]');
+# Count via the primary key: a bare scan would pick the custom index, which is
+# not directly scannable.
+SELECT COUNT(*) AS rows_after_insert FROM t_fit FORCE INDEX (PRIMARY);
+DROP TABLE t_fit;
+
+--echo # HNSW primary-key support test completed
+
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

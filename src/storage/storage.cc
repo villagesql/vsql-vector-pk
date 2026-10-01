@@ -885,10 +885,7 @@ bool ColumnStore::update_metadata(MtrCtx::Ref mctx, std::string_view metadata,
 // in storage_builder.h. Each method retrieves the user context via
 // storage->user() and delegates to its methods.
 //
-// Baseline (no rowid trailer). When SVECTOR_ROWID_TRAILER is defined this is
-// compiled out and column_storage_rowid.cc provides ColumnStorage instead.
-#ifndef SVECTOR_ROWID_TRAILER
-
+// The vector is stored as-is; the index owns row identity, so no rowid is kept.
 bool ColumnStorage::create(Ctx *storage, Space::Ref space,
                            Segment::TrxRef trx_ref, uint32_t col_len,
                            char *error_msg, uint32_t error_msg_len) {
@@ -955,7 +952,5 @@ bool ColumnStorage::purge(Ctx *storage, MtrCtx::Ref mctx,
   return storage->user()->m_stores[0].purge(mctx, trx_ref, col_ref, error_msg,
                                             error_msg_len);
 }
-
-#endif // !SVECTOR_ROWID_TRAILER
 
 }  // namespace svector
