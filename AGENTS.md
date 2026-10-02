@@ -24,7 +24,7 @@ make install
 
 The build process:
 1. Uses CMake with `FindVillageSQL.cmake` to locate the VillageSQL Extension SDK
-2. Compiles C++ source files into shared library `vsql-vector.so`
+2. Compiles C++ source files into shared library `libsvector.so` (CMake target `svector`)
 3. Packages library with `manifest.json` into `vsql_vector.veb` archive using `VEF_CREATE_VEB()`
 4. Optionally installs VEB to `veb_output_directory` in the VillageSQL build tree
 
@@ -32,7 +32,7 @@ Also builds `svector_page_dump`, a standalone diagnostic tool for inspecting SVE
 
 **Requirements:**
 - VillageSQL build tree (specified via `VillageSQL_BUILD_DIR`)
-- C++17 compiler
+- C++20 compiler
 
 **CMake Variables:**
 - `VillageSQL_BUILD_DIR`: Path to VillageSQL build directory (required)
@@ -54,8 +54,9 @@ The extension uses the VillageSQL Extension Framework's fluent builder API to re
 - Vector SQL functions
 
 **Available Functions:**
-- `SVECTOR(dims)` - Create a vector with specified dimensions
-- `SVECTOR_DISTANCE(v1, v2, metric)` - Compute distance between vectors (L1, L2, cosine, inner product)
+- `SVECTOR(dims)` - Declare a vector column with the given dimension
+- `L1_DISTANCE(v1, v2)`, `L2_DISTANCE(v1, v2)`, `COSINE_DISTANCE(v1, v2)`, `INNER_PRODUCT(v1, v2)` - Distance/similarity between vectors
+- `VECTOR_DIMENSION`, `VECTOR_MAX_DIMENSION`, `VECTOR_NORM`, `VECTOR_FORMAT`, `VECTOR_HEX` - Utility functions
 
 **SVECTOR Type:**
 - Fixed-dimension float32 vector stored in external columnar pages
@@ -97,4 +98,4 @@ perl mysql-test-run.pl --suite=/path/to/vsql-vector/mysql-test --veb-source-dir=
 
 The extension registers a custom `SVECTOR` type and all functions automatically when loaded. The VEB package contains:
 - `manifest.json` - Extension metadata
-- `lib/vsql-vector.so` - Shared library with VDF implementations
+- `lib/libsvector.so` - Shared library with VDF implementations

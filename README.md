@@ -2,33 +2,42 @@
 
 # VillageSQL Vector Extension (vsql-vector-pk)
 
-An extension for VillageSQL Server that adds a vector data type with external columnar storage (SVECTOR), enabling efficient vector operations and laying the foundation for future ANN search and indexing.
+An extension for VillageSQL Server that adds a vector data type with external
+columnar storage (SVECTOR) and an HNSW index for nearest-neighbour search.
 
-This is `vsql-vector-pk`, a downstream build of vsql-vector whose HNSW index owns the owning row's primary key, so a KNN scan can resolve hits back to full rows (see the note below). It builds and installs as the `vsql_vector` extension.
+HNSW (Hierarchical Navigable Small World) is a graph index for approximate
+k-nearest-neighbour (KNN) search: given a query vector it returns the k most
+similar stored vectors without scanning the whole table.
 
-> **This extension is under active development and is not stable.** It depends on [VillageSQL experimental extension APIs](https://villagesql.com/docs/mysql-8.4/0.0.5-dev/extension-api-reference#experimental-apis) that are subject to breaking changes without notice. It is not recommended for production use.
+This is `vsql-vector-pk`, a build of vsql-vector whose HNSW index stores each
+row's primary key, so a KNN scan can resolve index hits back to full rows and
+return their other columns — the plain vsql-vector index stores no row reference
+and cannot do this. It builds and installs as the `vsql_vector` extension, and a
+given server can run only one of vsql-vector and vsql-vector-pk at a time, since
+both register under that same extension name.
 
-> **Downstream variant — HNSW index owns the row's primary key.** The HNSW index
-> stores the owning row's primary key as part of its own on-disk structure, so an
-> index hit resolves back to its **full row** and a KNN scan can return the row's
-> other columns; mainline vsql-vector stores no row reference and cannot do this.
-> This is the variant to use for end-to-end ANN.
->
-> A small single-column key is held inline on the node; a larger or composite key
-> is packed into a separate per-index primary-key store. Composite (multi-part)
-> primary keys are fully supported, and a primary-key-less table is fine — InnoDB's
-> synthetic row id is used. The only limit is that a key too large to pack
-> (declared max over ~3 KB) is rejected at `CREATE INDEX`.
+> **This extension is under active development and is not stable.** It depends on
+> [VillageSQL preview extension APIs](https://villagesql.com/docs/mysql-8.4/0.0.5-dev/extension-api-reference#preview-apis)
+> that are subject to breaking changes without notice. It is not recommended for
+> production use.
+
+Primary keys may be a single column or a composite (multi-part) key, or the
+table may have no primary key at all — InnoDB's synthetic row id is used in that
+case. A small single-column key is held inline on the graph node; a larger or
+composite key is packed into a separate per-index primary-key store. The only
+limit is that a key whose declared maximum exceeds 3,072 packed bytes (including
+the length bytes) is rejected: at `CREATE INDEX` with a clear error, and when the
+index is declared inline at `CREATE TABLE` with the generic error 168.
 
 ## Features
 
 - **SVECTOR Type**: A float32 vector type with declared dimension and external columnar storage (up to 3072 dimensions)
+- **HNSW Index**: Graph-based KNN index with L2, L1, cosine, and inner-product metrics, queried through `ORDER BY <distance> ... LIMIT k`
 - **Distance Functions**: L1 (Manhattan) and L2 (Euclidean) distance metrics
 - **Similarity Functions**: Inner product, and angular distance via cosine distance
 - **Utility Functions**: Norm computation, dimension query, hex dump, and formatted output
 - **Native InnoDB Integration**: Columnar storage implemented via VillageSQL/InnoDB exposed storage APIs, inheriting ACID guarantees, MVCC, and buffer pool–based caching
-- **Efficient Storage**: External columnar storage with heap-style organization (non-clustered), providing stable vector addresses suitable for ANN index structures
-- **High Performance**: C++ implementation with bitmap-managed slot arrays and insert load distribution across pages via multiple free lists
+- **Row resolution**: The HNSW index stores each row's primary key, so a KNN hit resolves back to its full row
 
 ## Installation
 
@@ -50,12 +59,15 @@ This is `vsql-vector-pk`, a downstream build of vsql-vector whose HNSW index own
    ```bash
    mkdir -p build && cd build
    cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build
-   make -j$(nproc)
+   make -j8
    ```
 
-   This produces `vsql_vector.veb` in the build directory.
+   This produces `vsql_vector.veb` in the build directory. (`make -j$(nproc)`
+   also works on Linux; macOS has no `nproc`, where `make -j` with no number
+   runs unlimited parallel jobs — pass an explicit count instead.)
 
-   To build with debug symbols and assertions (no optimization):
+   The default build is optimized (`RelWithDebInfo`), and the distance kernels
+   are always compiled at `-O3`. To build with debug symbols and assertions:
    ```bash
    cmake .. -DVillageSQL_BUILD_DIR=/path/to/villagesql/build -DWITH_DEBUG=ON
    ```
@@ -78,7 +90,7 @@ SET PERSIST vsql_allow_preview_extensions = ON;
 INSTALL EXTENSION vsql_vector;
 ```
 
-To unload:
+To uninstall:
 
 ```sql
 UNINSTALL EXTENSION vsql_vector;
@@ -148,18 +160,22 @@ ORDER BY dist ASC
 LIMIT 2;
 -- Expected result: id=1 dist=0, id=2 dist=1
 
--- Update a vector value
+-- Update a vector value (allowed only when the column has no HNSW index)
 UPDATE embeddings SET vec = '[0.5, 0.5, 0.5, 0.5]' WHERE id = 1;
 
--- Delete a row containing a vector
+-- Delete a row containing a vector (allowed only when the column has no HNSW index)
 DELETE FROM embeddings WHERE id = 2;
 ```
 
+Updating a vector column and deleting a row are supported only while the column
+has no HNSW index; see [Indexing (HNSW)](#indexing-hnsw) for the DML
+restrictions that apply once an index exists.
+
 ### Indexing (HNSW)
 
-An approximate-nearest-neighbour (ANN) HNSW index is created on an `SVECTOR`
-column with `USING EXTENDED(hnsw)`. The distance metric is selected by an operator
-class after the column name (default is L2 if omitted):
+An HNSW index for approximate KNN search is created on an `SVECTOR` column with
+`USING EXTENDED(hnsw)`. The distance metric is selected by an operator class
+after the column name (default is L2 if omitted):
 
 | Operator class | Metric |
 |---|---|
@@ -167,12 +183,6 @@ class after the column name (default is L2 if omitted):
 | `hnsw_l1` | L1 (Manhattan) |
 | `hnsw_cosine` | Cosine |
 | `hnsw_inner_product` | Inner product |
-
-The HNSW index stores the owning row's primary key (see the note at the top), so
-an index hit resolves back to its full row. The primary key may be a single
-column or a **composite (multi-part) key**, or the table may be primary-key-less;
-the only restriction is that a key too large to pack (declared max over ~3 KB) is
-rejected at `CREATE INDEX`.
 
 ```sql
 CREATE TABLE docs (
@@ -189,6 +199,10 @@ CREATE INDEX idx_vec_cos ON docs (vec hnsw_cosine) USING EXTENDED(hnsw);
 ALTER TABLE docs ADD INDEX idx_vec_ip (vec hnsw_inner_product) USING EXTENDED(hnsw);
 ```
 
+The three statements above build three separate HNSW indexes on the same `vec`
+column; adding more than one index to a column raises warning 1831 (duplicate
+index) for each index after the first.
+
 `WITH (M = ..., ef_construction = ...)` sets the HNSW build parameters. Query the
 index with an `ORDER BY <distance>(col, <query vector>) LIMIT k`, using the
 distance function matching the index's operator class:
@@ -199,6 +213,9 @@ FROM docs
 ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
 LIMIT 10;
 ```
+
+The query vector must be a string literal, as shown. A placeholder (`?`) or a
+user variable in its place fails with `ERROR 3219`.
 
 #### Query-time tuning: `vsql_vector.ef_search`
 
@@ -225,46 +242,54 @@ LIMIT 10;
 #### Filtering with a `WHERE` clause (post-filter limitation)
 
 A `WHERE` clause may be combined with a KNN `ORDER BY ... LIMIT`, but filtering
-is applied **after** the index search, not before. The HNSW scan first returns
-its nearest-neighbour candidates — at most `ef_search` of them — and the `WHERE`
+is applied after the index search, not before. The HNSW scan first returns its
+nearest-neighbour candidates — at most `ef_search` of them, or the query's
+`LIMIT` if that is larger (see the flooring rule above) — and the `WHERE`
 predicate is then applied to that candidate set.
 
-As a result, a selective `WHERE` can leave **fewer than `LIMIT` rows, or even
-zero**, even when enough matching rows exist further out in the graph: rows that
-satisfy the predicate but fall outside the top `ef_search` by distance are never
+As a result, a selective `WHERE` can leave fewer than `LIMIT` rows, or even zero,
+even when enough matching rows exist further out in the graph: rows that satisfy
+the predicate but fall outside the top `ef_search` by distance are never
 considered. Raising `vsql_vector.ef_search` widens the candidate pool and can
 recover such rows, at the cost of a slower search; it is not a guarantee.
 
 ```sql
--- The category filter is applied to the top ef_search nearest rows only, so
--- this may return fewer than 10 rows if few of the nearest neighbours are in
--- category 7. Raise ef_search to widen the pool.
+-- Assume docs also has an `id` filter column. The predicate is applied to the
+-- top ef_search nearest rows only, so this may return fewer than 10 rows if few
+-- of the nearest neighbours satisfy it. Raise ef_search to widen the pool.
 SELECT id
 FROM docs
-WHERE category = 7
+WHERE id > 1000
 ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
 LIMIT 10;
 ```
 
-DDL and DML support on an HNSW-indexed table is currently limited. The index has
-no B-tree, so any operation that would maintain its entries is rejected with a
-clean error (the server is never crashed); operations that do not touch it are
-allowed:
+#### Supported statements on an HNSW-indexed table
 
-- **CREATE INDEX** is supported on an empty or a **populated** table: `CREATE
-  INDEX ... USING EXTENDED(hnsw)` builds the index over whatever rows already
-  exist, and it can equally be declared at `CREATE TABLE` with data loaded
-  afterwards.
-- **INSERT** is supported; the index is maintained as rows are inserted.
+DDL and DML support on an HNSW-indexed table is currently limited. The index has
+no B-tree, so most operations that would maintain its entries are rejected with a
+clean error, while operations that do not touch it are allowed. Two cases are not
+yet safe and are called out below.
+
+- **INSERT** is supported; the index is maintained as rows are inserted. Note
+  that a rolled-back or otherwise failed insert leaves the index damaged for now
+  — the graph edges added for the row are not undone.
 - **DELETE** of a row is not supported.
 - **UPDATE** that changes the indexed vector column, or the primary key, is not
   supported.
-- **UPDATE** of a non-indexed (payload) column **is** supported — it changes no
-  index ordering field, so the index is not touched.
-- **Upserts** (`REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE`) are rejected when
-  they hit an existing row, because they resolve to a delete or update. When they
-  insert a brand-new row (no key conflict) they behave as a plain, supported
-  INSERT.
+- **UPDATE** of a column that is not indexed is supported — it changes no index
+  ordering field, so the index is not touched.
+- **`INSERT ... ON DUPLICATE KEY UPDATE`** is supported when a matching row
+  exists and the update changes only columns that are not indexed. Only
+  **`REPLACE`** is always refused on an existing row, because it resolves to a
+  delete followed by an insert. When either inserts a brand-new row (no key
+  conflict) it behaves as a plain, supported INSERT.
+- **CREATE INDEX** can be declared at `CREATE TABLE`, or added to an empty table.
+  Building an HNSW index over an already-populated table (`CREATE INDEX ... USING
+  EXTENDED(hnsw)` on a table that already holds rows) is not safe yet and can
+  crash the server.
+- **CHECK TABLE** on an HNSW-indexed table is not safe yet and can crash the
+  server.
 
 ## Testing
 
@@ -288,87 +313,10 @@ perl mysql-test-run.pl --suite=/path/to/vsql-vector-pk/mysql-test --veb-source-d
 
 ## Diagnostic Tools
 
-The build also produces `svector_page_dump`, a standalone tool for inspecting SVECTOR storage pages in InnoDB tablespace files. See `src/storage/tools/README.md` for full usage.
-
-### Example: inspecting a data page with delete-marked records
-
-The following example shows output after inserting 5 rows into a `SVECTOR(4)` column and then deleting two of them (rows with id=2 and id=4) before the InnoDB purge thread has run. The delete-marked slots remain physically present in the page until purge. The SVECTOR column store holds the vector only; row identity lives in the HNSW index, not here.
-
-```bash
-$ svector_page_dump embeddings.ibd 4 -d 5 -r
-```
-
-```
-IBD File: embeddings.ibd
-Root Page Number: 4
-
-SVECTOR Root Page
-=================
-
-Version:           1
-Page Type:         1 (ROOT_PAGE)
-Creator:           SVECTOR
-Column Size:       16 bytes (4-dim float vector)
-
-Data Pages:
-  Total:           1
-  Free:            1
-  Head:            Page #5
-  Tail:            Page #5
-
-Free Slot Array:
-  Max Capacity:    2048 slots
-  Current Size:    1 slots
-  Non-empty Slots: 1
-
-================================================================================
-
-SVECTOR Data Page
-=================
-
-Version:           1
-Page Type:         2 (DATA_PAGE)
-Free Slot Number:  0
-
-SVECTOR Data Page Links:
-  Previous:        Page #4294967295 (NULL)
-  Next:            Page #4294967295 (NULL)
-
-SVECTOR Free Page Links:
-  Previous:        Page #4294967295 (NULL)
-  Next:            Page #4294967295 (NULL)
-
-Capacity:
-  Max Records:     673
-  Free Records:    668 (99.3%)
-  Allocated:       5 (0.7%)
-    Active:        3
-    Deleted:       2
-
-Record Bitmap:
-  AADAD...................................
-  ........................................
-  (remaining 633 free slots omitted)
-  (. = Free, A = Active, D = Deleted)
-
-Records (showing from slot 0, up to 10 records):
-  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40]
-  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] (DELETED)
-  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50]
-  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] (DELETED)
-  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44]
-```
-
-Each record holds the vector and its MVCC transaction id only. The owning row's
-primary key is stored by the HNSW index (inline on a graph node or in the index's
-primary-key store), not in this column store, so an index hit resolves back to
-its row via the index.
-
-Key observations:
-- **`DELETED` records** (slots 1 and 3) are still physically present and visible to concurrent transactions that started before the DELETE committed (MVCC). They are reclaimed by the purge thread once no active transaction can see them.
-- **Record Bitmap** encodes each slot's state in 2 bits: `A` = active (occupied, not deleted), `D` = delete-marked (occupied, pending purge), `.` = free (available for insert).
-- **Free Slot Number `0`** means this data page is tracked at index 0 in the root page's free slot array, making it eligible for the next insert without a root page scan.
-- **Max Records `673`** is the page capacity for `SVECTOR(4)` on a 16 KB InnoDB page, where each record is 24 bytes (16-byte vector + 8-byte MVCC trx id): `54 (header) + ⌈673×2/8⌉ (bitmap) + 673×24 (records) + 8 (page trailer) = 16383 bytes`.
+The build also produces `svector_page_dump`, a standalone tool for inspecting
+SVECTOR storage pages in InnoDB tablespace files. See
+[`src/storage/tools/README.md`](src/storage/tools/README.md) for full usage and a
+worked example of inspecting a data page with delete-marked records.
 
 ## Development
 
@@ -393,7 +341,7 @@ vsql-vector-pk/
 │   │       ├── hnsw_layout.h/.cc       # HNSW record layout helpers
 │   │       └── hnsw_graph.h/.cc        # HNSW graph rendering (-g)
 │   └── index/
-│       └── hnsw/              # HNSW ANN index implementation
+│       └── hnsw/              # HNSW index implementation
 │           ├── hnsw.h                  # Shared HNSW types/constants
 │           ├── pk_layout.h             # Primary-key inline/spill layout + packing
 │           ├── storage.h/.cc           # Index storage (graph levels/nodes, PK store)
@@ -406,8 +354,8 @@ vsql-vector-pk/
 │   └── FindVillageSQL.cmake  # CMake module to locate VillageSQL SDK
 ├── mysql-test/
 │   ├── t/                    # MTR test files
-│   ├── r/                    # MTR expected results
-│   └── unittest/             # Standalone unit tests
+│   └── r/                    # MTR expected results
+├── unittest/                 # Standalone unit tests
 ├── manifest.json             # VEB package manifest
 └── CMakeLists.txt            # Build configuration
 ```
@@ -427,5 +375,4 @@ VillageSQL welcomes contributions from the community. For more information, plea
 ## Contact
 
 - File a [bug or issue](https://github.com/villagesql/vsql-vector-pk/issues) and we will review
-- Start a discussion in the project [discussions](https://github.com/villagesql/vsql-vector-pk/discussions)
 - Join the [Discord channel](https://discord.gg/KSr6whd3Fr)
