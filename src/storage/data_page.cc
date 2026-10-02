@@ -468,8 +468,12 @@ bool DataPage::find_free_slot(Page &data_page, uint16_t &slot_index,
     uint8_t bitmap_bit = 0;
 
     if (free_bit_in_byte(bitmap_byte, bitmap_bit)) {
-      slot_index = byte_idx * 4 + (bitmap_bit >> 1);  // BITS_PER_RECORD is 2
-      assert(slot_index < m_max_num_recs);
+      uint16_t found = byte_idx * 4 + (bitmap_bit >> 1);  // BITS_PER_RECORD is 2
+      // The last bitmap byte can cover padding bits past the real slots when
+      // m_max_num_recs is not a multiple of 4; those bits read as free. Ignore
+      // a padding slot rather than hand out an out-of-range record.
+      if (found >= m_max_num_recs) break;
+      slot_index = found;
       return true;
     }
   }
@@ -480,8 +484,9 @@ bool DataPage::find_free_slot(Page &data_page, uint16_t &slot_index,
     uint8_t bitmap_bit = 0;
 
     if (free_bit_in_byte(bitmap_byte, bitmap_bit)) {
-      slot_index = byte_idx * 4 + (bitmap_bit >> 1);  // BITS_PER_RECORD is 2
-      assert(slot_index < m_max_num_recs);
+      uint16_t found = byte_idx * 4 + (bitmap_bit >> 1);  // BITS_PER_RECORD is 2
+      if (found >= m_max_num_recs) break;
+      slot_index = found;
       return true;
     }
   }
