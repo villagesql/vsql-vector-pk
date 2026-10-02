@@ -195,6 +195,93 @@ Every node reachable from the level's entry point is listed exactly once
 no `...`/`(seen above)` marker since a node is never re-expanded once
 listed.
 
+## Example: inspecting a data page with delete-marked records
+
+The following shows output after inserting 5 rows into a `SVECTOR(4)` column and
+then deleting two of them (ids 2 and 4) before the InnoDB purge thread has run.
+The delete-marked slots remain physically present in the page until purge. The
+SVECTOR column store holds the vector and its MVCC transaction id only; row
+identity lives in the HNSW index, not here.
+
+```bash
+$ svector_page_dump embeddings.ibd 4 -d 6 -r
+```
+
+```
+IBD File: embeddings.ibd
+Root Page Number: 4
+
+SVECTOR Root Page
+=================
+
+Version:           1
+Page Type:         1 (ROOT_PAGE)
+Creator:           SVECTOR
+Column Size:       16 bytes (4-dim float vector)
+
+Data Pages:
+  Total:           1
+  Free:            1
+  Head:            Page #6
+  Tail:            Page #6
+
+Free Slot Array:
+  Max Capacity:    2048 slots
+  Current Size:    1 slots
+  Non-empty Slots: 1
+
+================================================================================
+
+SVECTOR Data Page
+=================
+
+Version:           1
+Page Type:         2 (DATA_PAGE)
+Free Slot Number:  0
+
+SVECTOR Data Page Links:
+  Previous:        Page #4294967295 (NULL)
+  Next:            Page #4294967295 (NULL)
+
+SVECTOR Free Page Links:
+  Previous:        Page #4294967295 (NULL)
+  Next:            Page #4294967295 (NULL)
+
+Capacity:
+  Max Records:     672
+  Free Records:    667 (99.3%)
+  Allocated:       5 (0.7%)
+    Active:        3
+    Deleted:       2
+
+Record Bitmap:
+  ADADA...................................
+  ........................................
+  (remaining free slots omitted)
+  (. = Free, A = Active, D = Deleted)
+
+Records (showing from slot 0, up to 10 records):
+  [  0] Trx ID:        1001 Data:[0.10, 0.20, 0.30, 0.40]
+  [  1] Trx ID:        1002 Data:[0.90, 0.80, 0.70, 0.60] (DELETED)
+  [  2] Trx ID:        1003 Data:[0.50, 0.50, 0.50, 0.50]
+  [  3] Trx ID:        1004 Data:[3.14, 2.72, 1.41, 1.73] (DELETED)
+  [  4] Trx ID:        1005 Data:[0.11, 0.22, 0.33, 0.44]
+```
+
+Key observations:
+- **`DELETED` records** (slots 1 and 3) are still physically present and visible
+  to concurrent transactions that started before the DELETE committed (MVCC).
+  They are reclaimed by the purge thread once no active transaction can see them.
+- **Record Bitmap** encodes each slot's state in 2 bits: `A` = active (occupied,
+  not deleted), `D` = delete-marked (occupied, pending purge), `.` = free
+  (available for insert).
+- **Free Slot Number `0`** means this data page is tracked at index 0 in the root
+  page's free slot array, making it eligible for the next insert without a root
+  page scan.
+- The owning row's primary key is stored by the HNSW index (inline on a graph
+  node or in the index's primary-key store), not in this column store, so an
+  index hit resolves back to its row via the index.
+
 ## Finding Root Page Number
 
 The root page number is stored in the table's metadata. You can find it by:
