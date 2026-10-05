@@ -249,6 +249,16 @@ struct MockGraph {
     return false;
   }
 
+  // Diameter estimate backing the lenient stopping rule, tracked the same
+  // way IndexGraph does.
+  double diameter() const { return m_diameter; }
+  void observe_distance(double d) {
+    if (d > m_diameter) {
+      m_diameter = d;
+    }
+  }
+  double m_diameter = 0.0;
+
   bool neighbours(const Node &node, LevelId level, std::vector<Node> &out) {
     assert(level == node.level);
     if (fail_neighbours) {

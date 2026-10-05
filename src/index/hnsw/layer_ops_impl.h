@@ -33,6 +33,7 @@
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_LAYER_OPS_IMPL_H
 
 #include <cassert>
+#include <cmath>
 
 #include "layer_ops.h"
 
@@ -46,6 +47,31 @@ LayerOperations<Graph, Policy>::LayerOperations(Graph &graph,
 template <typename Graph, template <typename> class Policy>
 LayerOperations<Graph, Policy>::LayerOperations(Graph &graph, const Node &query)
     : m_graph(graph), m_query(query) {}
+
+// Relaxed form of the Algorithm 2 line-7 stopping bound. Instead of stopping
+// as soon as the nearest candidate is worse than the furthest result, allow
+// it to be up to LENIENCY times worse, tapering that slack off as the search
+// converges: a candidate far from the query (relative to the largest distance
+// seen, a stand-in for the graph diameter) gets the full allowance, one close
+// to the query gets almost none. Widens the frontier early, where expanding a
+// slightly-worse node can still open a route to a better region, without
+// paying for it once the result set has settled.
+//
+// Ported from MariaDB's MHNSW (lenient_furthest() in sql/vector_mhnsw.cc).
+template <typename Graph, template <typename> class Policy>
+typename LayerOperations<Graph, Policy>::Distance
+LayerOperations<Graph, Policy>::lenient_furthest() const {
+  const double d = static_cast<double>(m_results.top().distance);
+  const double maxd = m_graph.diameter();
+  const double d0 = maxd * LENIENCY / 2;
+  if (!(d0 > 0)) {
+    return m_results.top().distance;
+  }
+  const double k = 5;
+  const double x = (d - d0) / d0;
+  const double sigmoid = k * x / std::sqrt(1 + (k * k - 1) * x * x);
+  return static_cast<Distance>(d * (1 + (LENIENCY - 1) / 2 * (1 - sigmoid)));
+}
 
 template <typename Graph, template <typename> class Policy>
 bool LayerOperations<Graph, Policy>::search(
@@ -66,7 +92,7 @@ bool LayerOperations<Graph, Policy>::search(
     // Algorithm 2, line 7: distance(c, q) > distance(f, q). m_results can
     // be empty here if every candidate seen so far was invisible; in that
     // case there's no result yet to compare against, so keep expanding.
-    if (!m_results.empty() && m_results.top() < c) {
+    if (!m_results.empty() && lenient_furthest() < c.distance) {
       break;
     }
     if (expand(c.node, ef)) {
@@ -314,6 +340,10 @@ bool LayerOperations<Graph, Policy>::evaluate_distances(
     if (failed) {
       return true;
     }
+    // Feed the index-wide diameter estimate used by the lenient stopping
+    // rule. Kept on the graph rather than per-search so it is already warm
+    // when a search starts.
+    m_graph.observe_distance(static_cast<double>(candidate.distance));
   }
   return false;
 }
