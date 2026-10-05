@@ -245,6 +245,16 @@ private:
   // untouched. Returns true if a graph operation fails.
   bool evaluate_distances(std::vector<Candidate> &candidates, size_t begin = 0);
 
+  // The body of evaluate_distances() once the query variant has been resolved
+  // to a concrete alternative, so the per-candidate loop calls
+  // Graph::distance() directly instead of dispatching through std::visit.
+  // Query is either Node (insert: the node being linked) or NodeData (select:
+  // the query vector).
+  template <typename Query>
+  bool evaluate_distances_with(const Query &query,
+                               std::vector<Candidate> &candidates,
+                               size_t begin);
+
   // Seeds m_visited, m_candidates and m_results from the entry points
   // (Algorithm 2, lines 1-3). Returns true if a graph operation fails.
   // The public search() and seed() both wrap this, after their own reset().

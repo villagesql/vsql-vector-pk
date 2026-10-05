@@ -286,7 +286,7 @@ bool LayerOperations<Graph, Policy>::extend_with_neighbours() {
       return true;
     }
     for (const Node &neighbour : m_neighbour_buf) {
-      if (m_visited.insert(neighbour.key()).second) {
+      if (m_visited.mark(neighbour)) {
         m_expand_buf.emplace_back(neighbour);
       }
     }
@@ -331,14 +331,28 @@ bool LayerOperations<Graph, Policy>::evaluate_distances(
   // Distance computations are independent and could be parallelized
   // if Graph::distance() is thread-safe.
   hnsw_count_distances(candidates.size() - begin);
+
+  // The query alternative is fixed for the whole call, so resolve the variant
+  // ONCE here rather than per candidate. A std::visit inside the loop compiles
+  // to an indirect jump through the visitor vtable for every distance
+  // evaluation, which a profile of the resident-graph query path showed as the
+  // single largest self-time frame -- larger than the distance math it wraps.
+  // Hoisted out, it is one branch per call and the inner loop is a direct,
+  // inlinable call.
+  if (const Node *qn = std::get_if<Node>(&m_query)) {
+    return evaluate_distances_with(*qn, candidates, begin);
+  }
+  return evaluate_distances_with(*std::get_if<NodeData>(&m_query), candidates,
+                                 begin);
+}
+
+template <typename Graph, template <typename> class Policy>
+template <typename Query>
+bool LayerOperations<Graph, Policy>::evaluate_distances_with(
+    const Query &query, std::vector<Candidate> &candidates, size_t begin) {
   for (size_t i = begin; i < candidates.size(); ++i) {
     Candidate &candidate = candidates[i];
-    bool failed = std::visit(
-        [&](const auto &query) {
-          return m_graph.distance(query, candidate.node, candidate.distance);
-        },
-        m_query);
-    if (failed) {
+    if (m_graph.distance(query, candidate.node, candidate.distance)) {
       return true;
     }
     // Feed the index-wide diameter estimate used by the lenient stopping
@@ -362,12 +376,12 @@ bool LayerOperations<Graph, Policy>::seed_impl(
   // If the query is an existing graph node, mark it visited up front so it
   // cannot reappear as its own candidate during neighbour expansion.
   if (const Node *query_node = std::get_if<Node>(&m_query)) {
-    m_visited.insert(query_node->key());
+    m_visited.mark(*query_node);
   }
 
   // Algorithm 2, lines 1-3: v = C = W = ep.
   for (const Node &node : entry_points) {
-    if (m_visited.insert(node.key()).second) {
+    if (m_visited.mark(node)) {
       m_expand_buf.emplace_back(node);
     }
   }
@@ -401,7 +415,7 @@ bool LayerOperations<Graph, Policy>::expand(const Node &node, uint32_t ef) {
   // Algorithm 2, lines 10-11: v = v U e, for each unvisited neighbour.
   m_expand_buf.clear();
   for (const Node &neighbour : m_neighbour_buf) {
-    if (m_visited.insert(neighbour.key()).second) {
+    if (m_visited.mark(neighbour)) {
       m_expand_buf.emplace_back(neighbour);
     }
   }
