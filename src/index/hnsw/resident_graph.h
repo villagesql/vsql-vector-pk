@@ -169,6 +169,17 @@ public:
     return false;
   }
 
+  // Running estimate of the graph's diameter, feeding search()'s lenient
+  // stopping rule. Plain members rather than IndexGraph's atomics: the
+  // resident graph is a single-threaded PoC (see the file header), so there
+  // is no concurrent search to race with. Survives across queries, which is
+  // what the rule wants -- a per-search maximum starts at zero and hands out
+  // the least slack exactly where the frontier most needs widening.
+  double diameter() const { return m_diameter; }
+  void observe_distance(double d) {
+    if (d > m_diameter) m_diameter = d;
+  }
+
   // Fixed operand for is_dominated (matches the clean Graph contract): resolve
   // a node into a NodeData carrying its resident quantized vector pointer, so
   // the loop then calls distance(NodeData, Node) reusing it.
@@ -204,6 +215,10 @@ private:
 
   NodeObj *m_entry = nullptr;
   uint8_t m_entry_level = 0;
+
+  // Largest node-to-query distance seen by any search on this resident graph;
+  // the lenient stopping rule's stand-in for the graph diameter.
+  double m_diameter = 0.0;
 
   // Owned buffers for prepare_query: the decoded f32 query, then its quantized
   // QData. Reused across queries (single-threaded PoC), so one search's query
