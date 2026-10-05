@@ -28,6 +28,7 @@
 #include "hnsw.h"
 #include "storage.h"
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <span>
 #include <stack>
@@ -442,7 +443,26 @@ public:
   // level 0, per the HNSW paper).
   uint32_t Mmax(LevelId level) const;
 
+  // Largest node-to-query distance observed by any search on this index, as
+  // a running stand-in for the graph diameter. The lenient stopping rule
+  // uses it to scale how much slack a candidate gets; a per-search maximum
+  // starts at zero and so hands out the least slack at the very start of a
+  // search, which is where the frontier most needs widening. Relaxed
+  // ordering is fine: this is a heuristic scale, so a stale read only shifts
+  // the leniency slightly and never affects correctness of the result set.
+  double diameter() const {
+    return m_diameter.load(std::memory_order_relaxed);
+  }
+  void observe_distance(double d) {
+    double cur = m_diameter.load(std::memory_order_relaxed);
+    while (d > cur && !m_diameter.compare_exchange_weak(
+                          cur, d, std::memory_order_relaxed)) {
+    }
+  }
+
 private:
+  std::atomic<double> m_diameter{0.0};
+
   // Lock primitives backing LockGraph/LockLevels.
   void lock_graph(LockMode mode);
   void unlock_graph(LockMode mode);

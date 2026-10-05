@@ -69,6 +69,12 @@ private:
 //   // 'level' is the node's own level, as passed to search()/seed() below.
 //   bool neighbours(const Node&, LevelId level, std::vector<Node>& out);
 //
+//   // Running estimate of the graph's diameter, and the hook that feeds it.
+//   // search()'s lenient stopping rule scales its slack by this, and reports
+//   // every distance it computes back through observe_distance().
+//   double diameter() const;
+//   void observe_distance(double);
+//
 // Graph::Node must provide:
 //   using KeyType = ...;  // Hashable and equality comparable.
 //   KeyType key() const;
@@ -255,6 +261,14 @@ private:
   std::unordered_set<typename Node::KeyType> m_visited;
   MinQueue m_candidates;
   MaxQueue m_results;
+
+  // How much worse than the furthest result a candidate may be and still be
+  // expanded, at the lenient end of the taper. 1.0 disables the leniency and
+  // restores the plain Algorithm 2 stopping bound.
+  static constexpr double LENIENCY = 1.1;
+
+  // Relaxed stopping bound used in place of m_results.top() in search().
+  Distance lenient_furthest() const;
 
   // Scratch buffers reused across calls, so that repeated operations
   // don't reallocate their backing storage. Cleared by reset(); methods

@@ -111,6 +111,17 @@ struct LineGraph {
     return false;
   }
 
+  // Diameter estimate backing the lenient stopping rule. Tracked here the
+  // same way IndexGraph does, so the search tests exercise that rule rather
+  // than a degenerate zero-diameter version of it.
+  double diameter() const { return m_diameter; }
+  void observe_distance(double d) {
+    if (d > m_diameter) {
+      m_diameter = d;
+    }
+  }
+  double m_diameter = 0.0;
+
   bool neighbours(const Node &node, LevelId /*level*/, std::vector<Node> &out) {
     if (fail_neighbours) {
       return true;
