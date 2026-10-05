@@ -81,6 +81,14 @@ struct NodeObj {
   // The same logical node's record one level down (nullptr at level 0), mirror
   // of the on-disk lower_level pointer. Used by get_next_level_node.
   NodeObj *lower = nullptr;
+
+  // Generation of the search that last visited this node (see
+  // ResidentGraph::VisitedSet). Comparing it against the current generation
+  // replaces a hash-set insert per neighbour with a load and compare against a
+  // field already in the cache line the traversal just touched -- a profile of
+  // the resident query path put that hash insert at ~6.5% of self time. 0
+  // means never visited, so generations start at 1.
+  uint32_t visit_gen = 0;
 };
 
 class ResidentGraph {
@@ -100,6 +108,43 @@ public:
   // own m_query_qdata buffer (filled by prepare_query). Not a graph node.
   struct NodeData {
     const quant::QData *q = nullptr;
+  };
+
+  // Visited set for a search over this graph, picked up by LayerOperations in
+  // place of the default hash set. Resident nodes are stable objects, so
+  // "visited" is a generation stamp ON the node: clear() bumps the generation
+  // instead of erasing anything, and mark() is a load, compare and store
+  // against a field in the cache line the traversal has just touched.
+  //
+  // Single-threaded PoC (see the file header): the stamp lives on the shared
+  // node, so two concurrent searches would corrupt each other's visited sets.
+  // Concurrency needs per-search stamps (or a thread-indexed slot) and lands
+  // with the rest of the productionization work.
+  class VisitedSet {
+  public:
+    bool mark(const Node &node) {
+      if (node.obj->visit_gen == m_gen) return false;
+      node.obj->visit_gen = m_gen;
+      return true;
+    }
+    // Starts a new search: every node's stamp is now stale by construction.
+    // The counter is process-wide rather than per-VisitedSet because the
+    // stamps live on nodes shared by every search, and a LayerOperations (and
+    // so a VisitedSet) is constructed per operation -- a per-object counter
+    // would restart at 1 and collide with stamps an earlier search left
+    // behind. Wrapping to 0 would alias with the never-visited sentinel, so
+    // skip it; at one generation per search that takes 2^32 searches.
+    void clear() {
+      if (++s_gen == 0) s_gen = 1;
+      m_gen = s_gen;
+    }
+    // Only ever asserted on right after clear(), where a stamp-based set is
+    // empty by definition.
+    bool empty() const { return true; }
+
+  private:
+    static inline uint32_t s_gen = 0;
+    uint32_t m_gen = 0;  // 0 never matches a stamp until clear() runs
   };
 
   // Decodes + quantizes a raw encoded query vector ([ref][floats], as the
