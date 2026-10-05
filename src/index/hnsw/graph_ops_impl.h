@@ -140,7 +140,12 @@ bool GraphOperations<Graph>::insert(const NodeData &new_node_data,
       if (layer.search(candidates, level, m_graph.ef_construction())) {
         return true;
       }
-      if (consume_heuristic(layer, m_graph.M(), neighbours, &candidates)) {
+      // Mmax(level), not M: the base layer carries Mmax0 = 2*M connections
+      // (storage reserves room for that many), so selecting only M there
+      // leaves layer 0 at half its intended connectivity, which has to be
+      // paid for with a wider search frontier.
+      if (consume_heuristic(layer, m_graph.Mmax(level), neighbours,
+                            &candidates)) {
         return true;
       }
     }
