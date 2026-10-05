@@ -472,6 +472,11 @@ public:
   // level 0, per the HNSW paper).
   uint32_t Mmax(LevelId level) const;
 
+  // Graph diameter estimate for the lenient stopping rule. Kept on the
+  // store; see IndexStore::diameter().
+  double diameter() const { return m_store.diameter(); }
+  void observe_distance(double d) { m_store.observe_distance(d); }
+
 private:
   // Lock primitives backing LockGraph/LockLevels.
   void lock_graph(LockMode mode);

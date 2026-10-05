@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -609,6 +610,10 @@ private:
   // Guards construction and replacement of m_vector_cache only.
   std::mutex m_vector_cache_mutex;
 
+  // See diameter(). Lives here rather than on IndexGraph for the same reason
+  // as the vector cache: it has to persist across operations.
+  std::atomic<double> m_diameter{0.0};
+
 public:
   // The vector cache for this index, creating it on first call when the cache
   // mode asks for one, or nullptr when it does not. The mode is read HERE, per
@@ -623,6 +628,23 @@ public:
   void retire_vector_cache();
   // Drop vid's entry, when the VID is freed or reused by a write.
   void invalidate_vector_cache(VID vid);
+
+  // Largest node-to-query distance observed by any search on this index, as
+  // a running stand-in for the graph diameter. The lenient stopping rule
+  // uses it to scale how much slack a candidate gets; a per-search maximum
+  // starts at zero and so hands out the least slack at the very start of a
+  // search, which is where the frontier most needs widening. Relaxed
+  // ordering is fine: this is a heuristic scale, so a stale read only shifts
+  // the leniency slightly and never affects correctness of the result set.
+  double diameter() const {
+    return m_diameter.load(std::memory_order_relaxed);
+  }
+  void observe_distance(double d) {
+    double cur = m_diameter.load(std::memory_order_relaxed);
+    while (d > cur && !m_diameter.compare_exchange_weak(
+                          cur, d, std::memory_order_relaxed)) {
+    }
+  }
 
   // Resolve the primary key for the level-0 node named by nid into out_parts
   // (one entry per key part), copied out. For an inlined key the single part
