@@ -27,6 +27,7 @@
 
 #include <villagesql/preview/index_builder.h>
 #include <villagesql/preview/session_var.h>
+#include <villagesql/preview/status_var.h>
 #include <villagesql/preview/storage_builder.h>
 #include <villagesql/vsql.h>
 
@@ -40,6 +41,7 @@
 #include <limits>
 
 #include "distance_registry.h"
+#include "index/hnsw/layer_ops.h"
 #include "index/hnsw/storage.h"
 #include "native_vector.h"
 #include "storage/storage.h"
@@ -818,6 +820,23 @@ long long read_ef_search() {
 }
 } // namespace svector::hnsw
 
+// Search-cost instrumentation, exposed via SHOW STATUS. Both are monotonic
+// process-wide totals over every HNSW search and insert since the extension
+// loaded, so a workload's cost is the difference across it:
+//
+//   SHOW GLOBAL STATUS LIKE 'vsql_vector_%';   -- before
+//   ... run queries ...
+//   SHOW GLOBAL STATUS LIKE 'vsql_vector_%';   -- after
+//
+// distance_calls / nodes_expanded gives the mean fan-out actually walked,
+// and distance_calls per query is the number to compare across index
+// parameters -- it is the work the recall is bought with, independent of how
+// fast any one distance evaluation happens to be.
+namespace sv = vsql::preview_status_var;
+static auto HNSW_STATUS_VARS = sv::make_capability(
+    {sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
+     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded)});
+
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
         .with(STORAGE)
@@ -825,6 +844,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(HNSW_INDEX_CAPABILITY)
         .with(HNSW_PROFILE_CAPABILITY)
         .with(HNSW_SESSION_VARS)
+        .with(HNSW_STATUS_VARS)
         .type(SVECTOR)
 
         // Hex encoding of raw vector float bytes (SQL)
