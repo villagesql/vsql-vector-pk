@@ -58,6 +58,16 @@ inline DistFn dist_for_name(const char *name) {
   return nullptr;
 }
 
+// Whether this metric has a quantized (int16) kernel, and so whether an index
+// on it can attach a vector cache. Only squared L2 today: quantize.h has
+// dist_squared_l2_q and nothing else. Cosine is next and needs normalization
+// at cache-fill time plus its own kernel; inner product needs a kernel; L1 has
+// no precomputable per-vector reduction. The list lives here, next to the
+// names, so adding a metric means touching one place.
+inline bool has_quantized_kernel(const char *name) {
+  return name != nullptr && std::strcmp(name, kDistL2Squared) == 0;
+}
+
 }  // namespace svector::native
 
 #endif  // VILLAGESQL_EXAMPLES_VSQL_SVECTOR_SRC_DISTANCE_REGISTRY_H

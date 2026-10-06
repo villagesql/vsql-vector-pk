@@ -789,7 +789,7 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
 // move from a session variable to a per-index setting touches only this
 // function. Creating the cache lazily also means an index queried only in
 // CACHE_NONE mode never allocates one.
-VectorCache *IndexStore::vector_cache() {
+VectorCache *IndexStore::vector_cache(uint32_t dim) {
   const long long mode = read_cache_mode();
   // Only CACHE_VECTORS is implemented; the sysvar refuses anything higher
   // (MAX_IMPLEMENTED_CACHE_MODE), so this is the whole mapping today. When the
@@ -807,7 +807,8 @@ VectorCache *IndexStore::vector_cache() {
     return nullptr;
   }
   if (m_vector_cache == nullptr)
-    m_vector_cache = std::make_unique<VectorCache>(budget);
+    m_vector_cache = std::make_unique<VectorCache>(
+        budget, dim, quant::qvector_padded_dim(dim));
   else
     m_vector_cache->set_max_bytes(budget);
   return m_vector_cache.get();
@@ -987,7 +988,9 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   // cache too. Safe because the cache is keyed by VID and this insert's own
   // vector gets a fresh one -- it cannot collide with an entry, and the
   // vectors it reads are not the ones it is writing.
-  graph.set_vector_cache(ctx->user()->vector_cache());
+  graph.set_vector_cache(ctx->user()->vector_cache(
+      (index.get_max_col_len(VECTOR_KEY_POS) - IndexStore::KEY_REF_SIZE) /
+      static_cast<uint32_t>(sizeof(float))));
 
   // HAS_ROW_REF: the server hands the owning row's primary key in pkey_columns
   // (one entry per key column). The index stores it on the level-0 node -- an
@@ -996,6 +999,12 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   IndexGraph::NodeData node_data{key_columns[VECTOR_KEY_POS]};
   node_data.pkey_parts = pkey_columns;
   node_data.num_pkey_parts = index.get_primary_num_key_cols();
+  // The vector being inserted is not in the index yet, so the construction
+  // search would otherwise compare it as f32 against quantized neighbours.
+  // node_data.data must keep the ORIGINAL encoded bytes -- create_node() hands
+  // them to the server to store -- so the quantized form rides alongside in
+  // qdata rather than replacing it.
+  if (graph.prepare_external_operand(node_data)) return true;
   Node top_node;
   if (GraphOperations<IndexGraph>(graph).insert(node_data, top_node))
     return true;
@@ -1087,9 +1096,15 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
                    std::span<char>(err, err_len));
   // Cache is owned by the store, so it outlives this per-scan graph and the
   // next query sees what this one loaded. Null in CACHE_NONE.
-  graph.set_vector_cache(ctx->user()->vector_cache());
+  graph.set_vector_cache(ctx->user()->vector_cache(
+      (index.get_max_col_len(VECTOR_KEY_POS) - IndexStore::KEY_REF_SIZE) /
+      static_cast<uint32_t>(sizeof(float))));
 
   IndexGraph::NodeData query{scan_desc[0][VECTOR_KEY_POS]};
+  // The query vector never passes through the cache -- it is not in the index
+  // -- so quantize it here to match the operands it is about to be compared
+  // against. Once per search.
+  if (graph.prepare_external_operand(query)) return true;
   const uint32_t k = scan_desc.limit();
   const uint32_t ef_search =
       std::max<uint32_t>(k, static_cast<uint32_t>(read_ef_search()));

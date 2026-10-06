@@ -101,15 +101,15 @@ IndexGraph::IndexGraph(IndexStore &store, const Index &index,
 bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
   assert(vid.is_valid());
 
-  // Cache hit: point straight at the resident bytes. Note the address is
-  // STABLE per vid, unlike the scratch buffer below -- so a hit is safe for
-  // the evaluator's pointer-keyed decoded-operand reuse, where the scratch
-  // path is not. The callers invalidate conservatively either way.
+  // Cached path: the entry IS the kernel's operand -- decoded, quantized, with
+  // the metric's per-vector terms folded in. Nothing to decode and nothing to
+  // copy; out points straight at it. The address is stable per vid for as long
+  // as the entry is resident, unlike the scratch buffer below.
   if (m_vector_cache != nullptr) {
-    VectorCache::Entry e;
-    if (m_vector_cache->get(vid, e)) {
-      out.data.data = e.data;
-      out.data.length = e.length;
+    if (const quant::QData *q = m_vector_cache->get(vid)) {
+      out.data.data = reinterpret_cast<const unsigned char *>(q);
+      out.data.length = static_cast<uint32_t>(
+          quant::qdata_length(m_vector_cache->padded_dim()));
       return false;
     }
   }
@@ -124,20 +124,34 @@ bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
                            &out.data))
     return true;
 
-  // Populate on the way back. insert() copies, so the entry does not alias the
-  // scratch buffer the next call will overwrite.
-  if (m_vector_cache != nullptr)
-    m_vector_cache->insert(vid, out.data.data, out.data.length);
+  if (m_vector_cache == nullptr) return false;
+
+  // Miss on a cache-enabled index: decode, quantize, make it resident, and hand
+  // back the quantized form -- NOT the f32 bytes just fetched. Every operand
+  // takes the same path whether it hit or missed, so a result never depends on
+  // what happened to be cached.
+  const native::Data *decoded = nullptr;
+  if (m_dist.decode_encoded(out.data, m_ctx.m_decode_buf, &decoded,
+                            m_ctx.m_error))
+    return true;
+  const quant::QData *q = m_vector_cache->insert(vid, decoded->data);
+  out.data.data = reinterpret_cast<const unsigned char *>(q);
+  out.data.length =
+      static_cast<uint32_t>(quant::qdata_length(m_vector_cache->padded_dim()));
   return false;
 }
 
 bool IndexGraph::distance(const NodeData &a, const NodeData &b,
                           DistanceType &out) {
+  // operand() picks the quantized form for a vector that was prepared with
+  // one (the query, or the one being inserted) and the encoded bytes
+  // otherwise. Resolved vectors already arrive in the right form from
+  // resolve_node_data().
   // The leaf distance is a direct native-kernel call over the two operands'
   // decoded vectors, with operand a's decode reused across a traversal's
   // candidates. All of that -- the resolved kernel, the decode scratch, and the
   // fixed-operand reuse -- lives in m_dist; see distance_evaluator.h.
-  return m_dist.eval(a.data, b.data, out, m_ctx.m_error);
+  return m_dist.eval(operand(a), operand(b), out, m_ctx.m_error);
 }
 
 bool IndexGraph::distance(const Node &a, const Node &b, DistanceType &out) {

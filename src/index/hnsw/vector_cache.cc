@@ -26,53 +26,57 @@
 
 namespace svector::hnsw {
 
-bool VectorCache::get(VID vid, Entry &out) {
+const quant::QData *VectorCache::get(VID vid) {
   auto it = m_map.find(vid.value);
   if (it == m_map.end()) {
-    ++m_misses;
     stat_add(vcache_misses, 1);
-    return false;
+    return nullptr;
   }
   // Refresh: move to the front of the LRU. splice() relinks the node without
-  // moving it, so the bytes keep their address and any pointer the caller is
-  // still holding stays valid.
+  // moving it, so the entry keeps its address and any pointer the caller still
+  // holds stays valid.
   m_lru.splice(m_lru.begin(), m_lru, it->second);
-  out.data = it->second->bytes.data();
-  out.length = static_cast<uint32_t>(it->second->bytes.size());
-  ++m_hits;
   stat_add(vcache_hits, 1);
-  return true;
+  return it->second->qdata();
 }
 
-void VectorCache::insert(VID vid, const unsigned char *data, uint32_t length) {
-  if (length == 0) return;
-  // A vector that cannot fit on its own is never cached -- evicting the whole
-  // cache to hold one entry would be worse than not caching it.
-  if (length > m_max_bytes) return;
+const quant::QData *VectorCache::insert(VID vid, const float *src) {
+  // Budget too small to hold even one entry: quantize into the scratch and hand
+  // that back, so the caller still gets an operand. Nothing becomes resident.
+  if (m_entry_bytes > m_max_bytes) {
+    m_scratch.resize(m_entry_bytes);
+    auto *q = reinterpret_cast<quant::QData *>(m_scratch.data());
+    quant::quantize(src, m_dim, m_padded_dim, q);
+    return q;
+  }
 
   auto it = m_map.find(vid.value);
   if (it != m_map.end()) {
-    // Already resident (a concurrent-ish re-fetch, or a stale entry the caller
-    // re-read): replace in place rather than growing a duplicate.
-    stat_add(vcache_resident_bytes, -static_cast<long long>(it->second->bytes.size()));
-    m_bytes -= it->second->bytes.size();
+    // Already resident -- a re-fetch of an entry the caller re-read. Replace in
+    // place rather than growing a duplicate.
+    stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
+    m_bytes -= m_entry_bytes;
     m_lru.erase(it->second);
     m_map.erase(it);
   }
 
-  evict_to_fit(length);
+  evict_to_fit(m_entry_bytes);
 
-  m_lru.push_front(Node{vid, std::vector<unsigned char>(data, data + length)});
+  m_lru.push_front(Node{vid, std::vector<unsigned char>(m_entry_bytes)});
   m_map.emplace(vid.value, m_lru.begin());
-  m_bytes += length;
-  stat_add(vcache_resident_bytes, static_cast<long long>(length));
+  m_bytes += m_entry_bytes;
+  stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
+
+  auto *q = m_lru.front().qdata();
+  quant::quantize(src, m_dim, m_padded_dim, q);
+  return q;
 }
 
 void VectorCache::invalidate(VID vid) {
   auto it = m_map.find(vid.value);
   if (it == m_map.end()) return;
-  stat_add(vcache_resident_bytes, -static_cast<long long>(it->second->bytes.size()));
-  m_bytes -= it->second->bytes.size();
+  stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
+  m_bytes -= m_entry_bytes;
   m_lru.erase(it->second);
   m_map.erase(it);
 }
@@ -91,11 +95,10 @@ void VectorCache::set_max_bytes(size_t max_bytes) {
 
 void VectorCache::evict_to_fit(size_t incoming) {
   while (m_bytes + incoming > m_max_bytes && !m_lru.empty()) {
-    auto &victim = m_lru.back();
-    stat_add(vcache_resident_bytes, -static_cast<long long>(victim.bytes.size()));
+    stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
     stat_add(vcache_evictions, 1);
-    m_bytes -= victim.bytes.size();
-    m_map.erase(victim.vid.value);
+    m_bytes -= m_entry_bytes;
+    m_map.erase(m_lru.back().vid.value);
     m_lru.pop_back();
   }
 }

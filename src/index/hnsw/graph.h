@@ -141,6 +141,7 @@ struct GraphContext {
                size_t max_update_chunks, std::span<char> error)
       : m_neighbour_buf(neighbour_buf_size), m_overflow_buf(overflow_buf_size),
         m_vector_buf_1(vector_buf_size), m_vector_buf_2(vector_buf_size),
+        m_decode_buf(vector_buf_size), m_query_qbuf(vector_buf_size),
         m_update_slots(max_update_slots), m_link_slots(max_update_slots),
         m_chunk_ids(max_update_chunks), m_node_buf_1(max_update_slots),
         m_node_buf_2(max_update_slots), m_incoming_buf_1(max_update_slots),
@@ -150,6 +151,13 @@ struct GraphContext {
   ScratchBytes m_overflow_buf;
   ScratchBytes m_vector_buf_1;
   ScratchBytes m_vector_buf_2;
+  // Decode scratch for the cache fill path: an encoded value is decoded here
+  // before being quantized into the cache entry.
+  ScratchBytes m_decode_buf;
+  // Holds the quantized form of a vector that never passes through the cache
+  // because it is not in the index -- the query vector, or the one being
+  // inserted. Written once per search, not per distance call.
+  ScratchBytes m_query_qbuf;
 
   ScratchSlots m_update_slots;
   // On-disk slot indices of the incoming-flagged neighbour links
@@ -189,6 +197,13 @@ public:
 
   struct NodeData {
     IndexScanKey::KeyPartData data;
+    // For a vector not in the index (the query, or the one being inserted):
+    // its quantized form, set by prepare_external_operand() when a cache is
+    // attached. Kept SEPARATE from data, which must stay the original encoded
+    // bytes because create_node() hands those to the server to store. Null
+    // when there is no cache, and then `data` is what the distance uses.
+    IndexScanKey::KeyPartData qdata{};
+    bool has_qdata = false;
     // The owning row's primary key, stored on the level-0 node: pkey_parts
     // points at num_pkey_parts KeyPartData (one per key column), owned by the
     // caller for the duration of the insert. num_pkey_parts is 0 for internal
@@ -488,7 +503,39 @@ public:
   // Attach a vector cache to sit behind resolve_node_data(), or nullptr for
   // the uncached paged path. Not owned -- it lives on the IndexStore and
   // outlives any one IndexGraph, which is what lets it persist across queries.
-  void set_vector_cache(VectorCache *cache) { m_vector_cache = cache; }
+  // Attach a vector cache, or nullptr for the uncached paged path. Refused
+  // when this index's metric has no quantized kernel -- the cache stores a
+  // quantized form, so attaching one on, say, a cosine index would be a
+  // correctness bug rather than a slow path. Such an index simply runs as it
+  // does today. Not owned: the cache lives on the IndexStore and outlives any
+  // one IndexGraph, which is what lets it persist across queries.
+  void set_vector_cache(VectorCache *cache) {
+    if (cache != nullptr &&
+        !native::has_quantized_kernel(fetch_distance_helper_name().data()))
+      return;
+    m_vector_cache = cache;
+    // A cache means every operand is quantized, so the evaluator switches once
+    // here rather than branching per call.
+    if (cache != nullptr) m_dist.set_quantized(cache->padded_dim());
+  }
+
+  // Quantize a vector that is not in the index -- the query, or the one being
+  // inserted -- so it matches the cached operands it will be compared against.
+  // A no-op without a cache. Call once before a search, not per distance.
+  bool prepare_external_operand(NodeData &data) {
+    if (m_vector_cache == nullptr) return false;
+    if (m_dist.quantize_operand(data.data, m_ctx.m_query_qbuf, data.qdata,
+                                m_ctx.m_error))
+      return true;
+    data.has_qdata = true;
+    return false;
+  }
+
+  // The operand the kernel should see for a NodeData: its quantized form when
+  // one was prepared, else its encoded bytes.
+  static const IndexScanKey::KeyPartData &operand(const NodeData &d) {
+    return d.has_qdata ? d.qdata : d.data;
+  }
 
 private:
   VectorCache *m_vector_cache = nullptr;

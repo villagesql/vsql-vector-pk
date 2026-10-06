@@ -610,7 +610,9 @@ public:
   // mode asks for one, or nullptr when it does not. The mode is read HERE, per
   // call, rather than captured at construction -- so moving it from a sysvar to
   // a per-index setting later is a change to one function, not a restructure.
-  VectorCache *vector_cache();
+  // dim is the indexed column's component count; the cache needs it to
+  // quantize, and every entry is sized from it.
+  VectorCache *vector_cache(uint32_t dim);
 
   // Drop cached state. Called when a write changes the index under the cache,
   // and when the budget is reduced to nothing.

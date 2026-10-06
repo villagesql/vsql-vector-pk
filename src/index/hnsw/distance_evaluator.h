@@ -26,6 +26,7 @@
 
 #include "../../distance_registry.h"
 #include "../../native_vector.h"
+#include "../../quantize.h"
 #include "hnsw.h"
 
 #include <cstdint>
@@ -71,6 +72,50 @@ public:
 
   bool valid() const { return m_fn != nullptr; }
 
+  // Switch to quantized operands. Once set, eval() treats both operands as
+  // pointers to a quant::QData rather than encoded bytes: no decode, no copy,
+  // the kernel reads them in place. Set once when an index attaches a cache,
+  // never per call -- every operand on a cache-enabled index is quantized, hit
+  // or miss, so results do not depend on cache state.
+  //
+  // L2 only for now: quantize.h has dist_squared_l2_q and nothing else, and
+  // IndexStore::vector_cache() refuses to attach a cache on other metrics.
+  void set_quantized(uint32_t padded_dim) {
+    m_quantized = true;
+    m_padded_dim = padded_dim;
+  }
+  bool quantized() const { return m_quantized; }
+
+  // Decode an encoded value into the caller's buffer. Public so the cache fill
+  // path can decode before quantizing, reusing the one place that knows the
+  // persisted [ref][floats] layout.
+  bool decode_encoded(const Column::Data &v, ScratchBytes &buf,
+                      const native::Data **out, std::span<char> err) {
+    return decode(v, buf, out, err);
+  }
+
+  // Quantize an encoded operand into the caller's buffer and return it as a
+  // QData view. Used for the two vectors that never pass through the cache
+  // because they are not in the index: the query vector, and the vector being
+  // inserted. Both would otherwise be f32 against quantized neighbours.
+  bool quantize_operand(const Column::Data &v, ScratchBytes &buf,
+                        Column::Data &out, std::span<char> err) {
+    const native::Data *d = nullptr;
+    if (decode(v, m_decoded_b, &d, err)) return true;
+    const size_t need = quant::qdata_length(m_padded_dim);
+    if (buf.size() < need) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: quantize buffer too small (%zu < %zu)",
+               buf.size(), need);
+      return true;
+    }
+    auto *q = reinterpret_cast<quant::QData *>(buf.data());
+    quant::quantize(d->data, d->dim, m_padded_dim, q);
+    out.data = reinterpret_cast<const unsigned char *>(q);
+    out.length = static_cast<uint32_t>(need);
+    return false;
+  }
+
   // Invalidate the fixed-operand (a) decode cache. Call before an eval() whose
   // `a` comes from a reused buffer that now holds different bytes at the same
   // address.
@@ -88,6 +133,16 @@ public:
                m_helper_name);
       return true;
     }
+    if (m_quantized) {
+      // Both operands are already the kernel's form -- nothing to decode, no
+      // scratch to copy into, and the per-vector terms (abs2) were folded in
+      // when they were quantized.
+      out = quant::dist_squared_l2_q(
+          reinterpret_cast<const quant::QData *>(a.data),
+          reinterpret_cast<const quant::QData *>(b.data), m_padded_dim);
+      return false;
+    }
+
     const native::Data *a_data = nullptr;
     const native::Data *b_data = nullptr;
     // Operand a is fixed across a traversal's candidates, so reuse its decode
@@ -136,6 +191,10 @@ private:
   // Source pointer last decoded into m_decoded_a; nullptr means nothing
   // reusable is held. See the reuse model above.
   const unsigned char *m_decoded_a_src = nullptr;
+
+  // Set by set_quantized(): operands are quant::QData, not encoded bytes.
+  bool m_quantized = false;
+  uint32_t m_padded_dim = 0;
   // The bound helper name, kept only when it did not resolve, for eval()'s
   // error message. Same 64-byte cap the server name lookup uses.
   char m_helper_name[64] = {};
