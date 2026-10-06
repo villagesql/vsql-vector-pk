@@ -977,6 +977,12 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   IndexGraph graph(*ctx->user(), index, trx_ref,
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
+  // Construction searches the graph far more than a query does, and reads the
+  // same existing vectors through the same funnel, so it benefits from the
+  // cache too. Safe because the cache is keyed by VID and this insert's own
+  // vector gets a fresh one -- it cannot collide with an entry, and the
+  // vectors it reads are not the ones it is writing.
+  graph.set_vector_cache(ctx->user()->vector_cache());
 
   // HAS_ROW_REF: the server hands the owning row's primary key in pkey_columns
   // (one entry per key column). The index stores it on the level-0 node -- an

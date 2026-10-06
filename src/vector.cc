@@ -41,8 +41,7 @@
 #include <limits>
 
 #include "distance_registry.h"
-#include "index/hnsw/layer_ops.h"
-#include "index/hnsw/vector_cache.h"
+#include "index/hnsw/stats.h"
 #include "index/hnsw/storage.h"
 #include "native_vector.h"
 #include "storage/storage.h"
@@ -891,7 +890,8 @@ static auto HNSW_PROFILE_CAPABILITY = IndexProfileCapability()
                                           .index_profile(HNSW_COSINE_PROFILE)
                                           .index_profile(HNSW_IP_PROFILE);
 
-// vsql_vector.ef_search: per-session HNSW query-time search breadth.
+// Per-session search tuning. ef_search is genuinely per-connection: two
+// sessions can want different search breadth against the same index.
 namespace ssv = vsql::preview_session_var;
 static auto HNSW_SESSION_VARS = ssv::make_capability({
     ssv::make_int(
@@ -901,25 +901,42 @@ static auto HNSW_SESSION_VARS = ssv::make_capability({
         .default_(svector::hnsw::DEFAULT_EF_SEARCH)
         .min(svector::hnsw::MIN_EF_SEARCH)
         .max(svector::hnsw::MAX_EF_SEARCH),
+});
+static auto HNSW_EF_SEARCH = HNSW_SESSION_VARS.int_var("ef_search");
+
+// Cache configuration. These describe a SHARED resource -- one cache per
+// index, used by every session -- so per-session values are meaningless: two
+// connections cannot each have their own copy of one index's cache. They are
+// declared here only because the preview SDK offers session variables and not
+// index options, and they are usable in practice via SET GLOBAL, which is what
+// the benchmark harness does. They belong on the index:
+//
+//   ALTER INDEX idx_v ON t SET cache_mode = ..., cache_size = ...
+//
+// Everything reads them through read_cache_mode()/read_max_cache_size() at the
+// point of use, so that move is local to those two functions plus
+// IndexStore::vector_cache().
+static auto HNSW_CACHE_VARS = ssv::make_capability({
     ssv::make_int(
         "cache_mode",
         "How much of the index is served from memory: 0 = none (pages only), "
         "1 = vectors (decoded vectors cached by VID), 2 = layers (upper levels "
         "pinned in memory, level 0 from pages), 3 = full (every level pinned). "
-        "Higher modes are faster but hold more memory.")
+        "Higher modes are faster but hold more memory. Set it globally -- it "
+        "configures a cache the whole index shares.")
         .default_(svector::hnsw::DEFAULT_CACHE_MODE)
         .min(svector::hnsw::CACHE_NONE)
         .max(svector::hnsw::CACHE_FULL),
     ssv::make_int(
         "max_cache_size",
-        "Upper limit in bytes for one index's vector cache.")
+        "Upper limit in bytes for one index's vector cache. Set it globally -- "
+        "it configures a cache the whole index shares.")
         .default_(svector::hnsw::DEFAULT_MAX_CACHE_SIZE)
         .min(svector::hnsw::MIN_MAX_CACHE_SIZE)
         .max(svector::hnsw::MAX_MAX_CACHE_SIZE),
 });
-static auto HNSW_EF_SEARCH = HNSW_SESSION_VARS.int_var("ef_search");
-static auto HNSW_CACHE_MODE = HNSW_SESSION_VARS.int_var("cache_mode");
-static auto HNSW_MAX_CACHE_SIZE = HNSW_SESSION_VARS.int_var("max_cache_size");
+static auto HNSW_CACHE_MODE = HNSW_CACHE_VARS.int_var("cache_mode");
+static auto HNSW_MAX_CACHE_SIZE = HNSW_CACHE_VARS.int_var("max_cache_size");
 
 namespace svector::hnsw {
 long long read_ef_search() {
@@ -954,13 +971,18 @@ long long read_max_cache_size() {
 // parameters -- it is the work the recall is bought with, independent of how
 // fast any one distance evaluation happens to be.
 namespace sv = vsql::preview_status_var;
-static auto HNSW_STATUS_VARS = sv::make_capability(
-    {sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
-     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded),
-     sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
-     sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
-     sv::make_int("cache_evictions", &svector::hnsw::vcache_evictions),
-     sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes)});
+static auto HNSW_STATUS_VARS = sv::make_capability({
+    // Search cost. distance_calls / nodes_expanded is the mean fan-out walked;
+    // distance_calls per query is the work a given recall was bought with.
+    sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
+    sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded),
+    // Vector cache. hits/(hits+misses) is the hit rate; a rising eviction
+    // count against a flat hit rate means the budget is too small for the
+    // working set. cache_bytes is a gauge, the rest are monotonic.
+    sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
+    sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
+    sv::make_int("cache_evictions", &svector::hnsw::vcache_evictions),
+    sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes)});
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
@@ -969,6 +991,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(HNSW_INDEX_CAPABILITY)
         .with(HNSW_PROFILE_CAPABILITY)
         .with(HNSW_SESSION_VARS)
+        .with(HNSW_CACHE_VARS)
         .with(HNSW_STATUS_VARS)
         .type(SVECTOR)
 
