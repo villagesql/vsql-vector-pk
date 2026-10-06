@@ -828,25 +828,19 @@ void test_insert_shrinks_overflowed_neighbours_past_mmax() {
 
   assert(!do_insert(g, 2, 3));
 
-  using GraphOps = svector::hnsw::GraphOperations<MockGraph>;
-
   // 2's own neighbour selection: candidates are 1 (distance 2) and 0
-  // (distance 3). 1 is nearest and always kept. 0 is dominated -- closer to
-  // 1 (distance 1) than to the query -- so whether it survives depends on
-  // GraphOps::SHOULD_KEEP_PRUNED_CONNECTIONS: Yes backfills it in anyway, No
-  // discards it outright. Branching on the same constant GraphOperations
-  // itself uses means this test keeps working whichever way that default is
-  // set, without needing hand-editing every time it's revisited.
+  // (distance 3). 1 is nearest and always kept; 0 is dominated -- closer to 1
+  // (distance 1) than to the query -- so it is set aside as a pruned
+  // candidate. keep_pruned_connections would backfill it, but the backfill is
+  // bounded by the same degree cap the selection is (layer_ops_impl.h's
+  // "m_neighbour_buf.size() < M" guard), and Mmax here is 1, which node 1
+  // already fills. So 2 keeps a single edge whatever that policy is set to --
+  // a node never exceeds Mmax to accommodate a backfill.
   //
-  // 2's own outgoing edges are unaffected either way: shrinking only touches
-  // the *neighbour's* list (graph_ops_impl.h's shrink_neighbours()), never
-  // the newly inserted node's own list.
-  if (GraphOps::SHOULD_KEEP_PRUNED_CONNECTIONS ==
-      GraphOps::KeepPrunedConnections::Yes) {
-    assert((g.adjacency[0][2] == std::vector<int>{1, 0}));
-  } else {
-    assert((g.adjacency[0][2] == std::vector<int>{1}));
-  }
+  // This list is written by create_node() from the heuristic's output, before
+  // any shrinking: shrink_neighbours() only ever rewrites a *neighbour's*
+  // list, never the inserted node's own.
+  assert((g.adjacency[0][2] == std::vector<int>{1}));
 
   // 1's reciprocal link back to 2 would push it over Mmax=1, so
   // shrink_neighbours() reselects from 1's existing connection (0) plus the
@@ -855,27 +849,19 @@ void test_insert_shrinks_overflowed_neighbours_past_mmax() {
   // original edge.
   assert((g.adjacency[0][1] == std::vector<int>{0}));
 
-  // 0 only gets a reciprocal-link/shrink attempt at all if 2 selected it as
-  // a neighbour in the first place, which is exactly the branch above.
-  // Either way 0 keeps its original edge to 1: with
-  // SHOULD_KEEP_PRUNED_CONNECTIONS == Yes, 0's own shrink (candidates {1, 2},
-  // Mmax=1) keeps nearer 1 over 2; with No, 0 is never a candidate for
-  // anything and is simply untouched.
+  // 2 did not select 0, so 0 never gets a reciprocal-link or shrink attempt
+  // and keeps its original edge to 1 untouched.
   assert((g.adjacency[0][0] == std::vector<int>{1}));
 
-  // Exactly as many neighbours as 2 ended up linking to (1, or 1 and 0) go
-  // through the shrink-and-replace path.
+  // Exactly as many neighbours as 2 linked to -- just 1 -- go through the
+  // shrink-and-replace path.
   int replace_count = 0;
   for (const std::string &entry : g.call_log) {
     if (entry.rfind("replace:", 0) == 0) {
       ++replace_count;
     }
   }
-  int expected_replace_count = GraphOps::SHOULD_KEEP_PRUNED_CONNECTIONS ==
-                                       GraphOps::KeepPrunedConnections::Yes
-                                   ? 2
-                                   : 1;
-  assert(replace_count == expected_replace_count);
+  assert(replace_count == 1);
 }
 
 void test_insert_replace_neighbours_failure_propagates() {
