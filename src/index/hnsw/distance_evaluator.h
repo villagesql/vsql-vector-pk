@@ -63,7 +63,8 @@ public:
   // each value before decoding the floats.
   DistanceEvaluator(const char *helper_name, size_t buf_size, uint32_t prefix)
       : m_fn(native::dist_for_name(helper_name)), m_prefix(prefix),
-        m_decoded_a(buf_size), m_decoded_b(buf_size) {
+        m_decoded_a(buf_size), m_decoded_b(buf_size), m_qbuf_a(buf_size),
+        m_qbuf_b(buf_size) {
     if (m_fn == nullptr && helper_name != nullptr) {
       // Keep the name for eval()'s error; the buffer is small and fixed.
       std::strncpy(m_helper_name, helper_name, sizeof(m_helper_name) - 1);
@@ -151,20 +152,37 @@ public:
                m_helper_name);
       return true;
     }
-    // The quantized kernel runs only when BOTH operands are already in that
-    // form: either both came from the cache, or b did and a is the external
-    // vector whose quantized copy was prepared once for this search. Any other
-    // combination falls through to the f32 kernel below, which is why a vector
-    // the cache refused costs a page read and nothing more.
-    const quant::QData *qa = nullptr;
-    if (a_quantized) {
-      qa = reinterpret_cast<const quant::QData *>(a.data);
-    } else if (b_quantized && m_qa != nullptr && a.data == m_fixed_f32_src) {
-      qa = m_qa;
-    }
-    if (b_quantized && qa != nullptr) {
-      out = quant::dist_squared_l2_q(
-          qa, reinterpret_cast<const quant::QData *>(b.data), m_padded_dim);
+    // A quantized operand has no f32 form to fall back to -- the cache holds
+    // only the QData -- so once EITHER operand is quantized the comparison has
+    // to run the quantized kernel, and the other operand must be brought into
+    // that form.
+    //
+    // Three ways that resolves, cheapest first:
+    //   both quantized          -- the common case once the cache is warm
+    //   a is the fixed operand  -- its quantized copy was made once per search
+    //   mixed                   -- quantize the unquantized one here
+    //
+    // Only the third costs anything, and only on a pair where one vector is
+    // resident and the other was refused. Quantizing EVERY uncached read
+    // instead (the previous design) measured 3.6x slower on build and 0.41x on
+    // queries once the cache was full, because the result was discarded every
+    // time.
+    if (a_quantized || b_quantized) {
+      const quant::QData *qa = nullptr;
+      const quant::QData *qb = nullptr;
+      if (a_quantized) {
+        qa = reinterpret_cast<const quant::QData *>(a.data);
+      } else if (m_qa != nullptr && a.data == m_fixed_f32_src) {
+        qa = m_qa;
+      } else if (to_qdata(a, m_qbuf_a, &qa, err)) {
+        return true;
+      }
+      if (b_quantized) {
+        qb = reinterpret_cast<const quant::QData *>(b.data);
+      } else if (to_qdata(b, m_qbuf_b, &qb, err)) {
+        return true;
+      }
+      out = quant::dist_squared_l2_q(qa, qb, m_padded_dim);
       return false;
     }
 
@@ -184,6 +202,26 @@ public:
   }
 
 private:
+  // Decode an encoded operand and quantize it into `buf`, for the mixed case
+  // where the other operand is already quantized. `buf` is per-operand, so the
+  // two sides of one comparison cannot overwrite each other.
+  bool to_qdata(const Column::Data &v, ScratchBytes &buf,
+                const quant::QData **out, std::span<char> err) {
+    const native::Data *d = nullptr;
+    if (decode(v, m_decoded_b, &d, err)) return true;
+    const size_t need = quant::qdata_length(m_padded_dim);
+    if (buf.size() < need) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: quantize buffer too small (%zu < %zu)",
+               buf.size(), need);
+      return true;
+    }
+    auto *q = reinterpret_cast<quant::QData *>(buf.data());
+    quant::quantize(d->data, d->dim, m_padded_dim, q);
+    *out = q;
+    return false;
+  }
+
   bool decode(const Column::Data &v, ScratchBytes &buf,
               const native::Data **dp, std::span<char> err) {
     if (v.length < m_prefix) {
@@ -213,6 +251,11 @@ private:
   // for the kernel call.
   ScratchBytes m_decoded_a;
   ScratchBytes m_decoded_b;
+  // Quantize scratch for the mixed case; one per operand so a comparison's two
+  // sides never share a buffer. Sized like the decode buffers, from the
+  // indexed column's maximum value length, which a QData always fits in.
+  ScratchBytes m_qbuf_a;
+  ScratchBytes m_qbuf_b;
   // Source pointer last decoded into m_decoded_a; nullptr means nothing
   // reusable is held. See the reuse model above.
   const unsigned char *m_decoded_a_src = nullptr;
