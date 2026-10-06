@@ -90,62 +90,124 @@ public:
   // `padded_dim` is the quantized vector length every entry is built to (see
   // quant::qvector_padded_dim); the kernel requires it to be uniform, so it is
   // fixed for the cache's lifetime rather than carried per entry.
-  VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
-      : m_max_bytes(max_bytes), m_dim(dim), m_padded_dim(padded_dim),
-        m_entry_bytes(quant::qdata_length(padded_dim)) {}
+  VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim);
 
-  // Look up vid. Returns the resident QData, or nullptr on a miss; the LRU
-  // position is refreshed on a hit.
+  // Look up vid. Returns the resident QData, or nullptr on a miss.
   const quant::QData *get(VID vid);
 
   // Quantize `dim` floats at `src` and make the result resident for vid,
-  // returning it. Evicts least-recently-used entries first if that would
-  // exceed the budget. Returns the entry even when the budget is too small to
-  // retain it, so the caller always gets an operand back.
+  // returning it. Evicts if that would exceed the budget. Returns the entry
+  // even when the budget is too small to retain it, so the caller always gets
+  // an operand back.
   const quant::QData *insert(VID vid, const float *src);
 
   // Drop one entry (its VID was freed and may be reused) or everything.
   void invalidate(VID vid);
   void clear();
 
-  // Change the budget, evicting down to it if it shrank.
+  // Change the budget. Shrinking evicts down to it; growing does not reallocate
+  // the slab, so the new ceiling takes effect only up to the capacity the cache
+  // was built with.
   void set_max_bytes(size_t max_bytes);
 
   uint32_t dim() const { return m_dim; }
   uint32_t padded_dim() const { return m_padded_dim; }
-  size_t resident_bytes() const { return m_bytes; }
-  size_t entries() const { return m_map.size(); }
+  size_t resident_bytes() const { return m_live * m_entry_bytes; }
+  size_t entries() const { return m_live; }
 
 private:
-  struct Node {
-    VID vid;
-    // A QData with its flexible dims[] array, so one allocation per entry.
-    std::vector<unsigned char> bytes;
-    quant::QData *qdata() {
-      return reinterpret_cast<quant::QData *>(bytes.data());
-    }
+  // SLOT STORAGE. One slab, allocated once at capacity, entries at fixed
+  // stride -- so a slot's address never moves and the lifetime contract above
+  // holds by construction rather than by a container's guarantees. One
+  // allocation for the whole cache, and a QData is reached by indexing rather
+  // than by chasing a pointer.
+  std::vector<unsigned char> m_slab;
+  // Slots the slab was BUILT to hold. Fixed for the cache's life: the slab is
+  // never reallocated, because that would move every entry and invalidate the
+  // pointers callers hold.
+  uint32_t m_capacity = 0;
+  // Slots the CURRENT budget allows, <= m_capacity. Separate from capacity so
+  // max_cache_size can be lowered at runtime: the slab keeps its allocation
+  // but the cache holds fewer entries. Raising it again takes effect only up
+  // to m_capacity.
+  uint32_t m_limit = 0;
+  uint32_t m_live = 0;      // slots currently occupied
+  uint32_t m_used = 0;      // high-water mark: slots ever handed out
+  // Slots freed by invalidate(). An invalidated slot is NOT compacted away by
+  // moving another entry into it -- that would relocate bytes a caller may
+  // still be pointing at -- so it is parked here and reused in place.
+  std::vector<uint32_t> m_free;
+
+  quant::QData *slot_data(uint32_t slot) {
+    return reinterpret_cast<quant::QData *>(m_slab.data() +
+                                            size_t{slot} * m_entry_bytes);
+  }
+
+  // CLOCK eviction, not LRU. An exact LRU relinks a list node on every hit --
+  // six pointer writes across three scattered nodes -- and a profile put that
+  // splice at 8.5% of query time while the ordering it maintained was never
+  // read, because nothing had been evicted. CLOCK sets one byte in a cache
+  // line the caller has just touched, and approximates LRU well enough: the
+  // hand sweeps, clearing `referenced` on entries that have been used and
+  // evicting the first that has not (second chance).
+  struct Meta {
+    uint64_t vid = 0;
+    bool occupied = false;
+    bool referenced = false;
   };
+  std::vector<Meta> m_meta;
+  uint32_t m_hand = 0;
 
-  // MRU at the front. The map points at list nodes, whose addresses std::list
-  // keeps stable across insert and erase of OTHER elements -- which is what
-  // makes the lifetime contract above hold.
-  std::list<Node> m_lru;
-  std::unordered_map<uint64_t, std::list<Node>::iterator> m_map;
+  // OPEN-ADDRESSED INDEX, vid -> slot. Replaces std::unordered_map, whose
+  // chaining costs two dependent cache misses per probe (bucket array, then
+  // the chain node). This is one flat array of {vid, slot}: linear probing
+  // keeps the common case to a single miss, and probes that do collide land on
+  // the same cache line. Power-of-two sized and kept at <= 50% load so probe
+  // runs stay short.
+  //
+  // A direct-mapped table would be better still, but a VID is a Column::Ref --
+  // a {page, slot} encoding, not a sequence number -- so the key space is far
+  // larger than the row count and sparse. Hence a hash, with a mixing step:
+  // the low bits of a ref are slot indices that repeat across pages, and
+  // libstdc++'s std::hash<uint64_t> is the identity, so the raw key clusters
+  // badly.
+  struct Bucket {
+    uint64_t vid = 0;  // 0 == empty; VID::INVALID is 0 so this is unambiguous
+    uint32_t slot = 0;
+  };
+  std::vector<Bucket> m_index;
+  uint64_t m_index_mask = 0;
 
-  // The scratch an insert quantizes into when the entry cannot be retained,
-  // so the caller still gets a usable operand back. Reused; valid only until
-  // the next insert, which is enough because the caller consumes it before
-  // asking for another vector.
+  static uint64_t mix(uint64_t x) {
+    // splitmix64 finalizer: cheap, and spreads the low-entropy slot bits of a
+    // Column::Ref across the whole word.
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+  }
+
+  // Index probe: returns the bucket for vid, occupied or free to claim.
+  Bucket *probe(uint64_t vid);
+  void index_insert(uint64_t vid, uint32_t slot);
+  void index_erase(uint64_t vid);
+  // Linear probing leaves a hole on erase that would cut a probe run short, so
+  // the run after the hole is reinserted.
+  void index_repair_from(uint64_t start);
+
+  // Evict one slot via the CLOCK hand. Returns the freed slot.
+  uint32_t evict_one();
+
+  // Scratch for an insert that cannot be retained (budget smaller than one
+  // entry), so the caller still gets a usable operand.
   std::vector<unsigned char> m_scratch;
 
   size_t m_max_bytes;
   const uint32_t m_dim;
   const uint32_t m_padded_dim;
-  // Every entry is the same size, since dim is fixed per index.
   const size_t m_entry_bytes;
-  size_t m_bytes = 0;
-
-  void evict_to_fit(size_t incoming);
 };
 
 } // namespace svector::hnsw

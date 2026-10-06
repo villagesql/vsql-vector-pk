@@ -28,6 +28,7 @@
 #include <villagesql/preview/index_builder.h>
 #include <villagesql/preview/session_var.h>
 #include <villagesql/preview/status_var.h>
+#include <villagesql/preview/sys_var.h>
 #include <villagesql/preview/storage_builder.h>
 #include <villagesql/vsql.h>
 
@@ -905,41 +906,43 @@ static auto HNSW_SESSION_VARS = ssv::make_capability({
 static auto HNSW_EF_SEARCH = HNSW_SESSION_VARS.int_var("ef_search");
 
 // Cache configuration. These describe a SHARED resource -- one cache per
-// index, used by every session -- so per-session values are meaningless: two
-// connections cannot each have their own copy of one index's cache. They are
-// declared here only because the preview SDK offers session variables and not
-// index options, and they are usable in practice via SET GLOBAL, which is what
-// the benchmark harness does. They belong on the index:
+// index, used by every session -- so they are global, not per-session: two
+// connections cannot each have their own copy of one index's cache, and a
+// session-scoped value would let whichever connection ran first fix the budget
+// while later ones silently resized or dropped the cache underneath it.
+//
+// They still belong on the index rather than on the server, since the cache is
+// per-index:
 //
 //   ALTER INDEX idx_v ON t SET cache_mode = ..., cache_size = ...
 //
 // Everything reads them through read_cache_mode()/read_max_cache_size() at the
 // point of use, so that move is local to those two functions plus
 // IndexStore::vector_cache().
-static auto HNSW_CACHE_VARS = ssv::make_capability({
-    ssv::make_int(
+namespace gsv = vsql::preview_sys_var;
+static long long g_cache_mode = svector::hnsw::DEFAULT_CACHE_MODE;
+static long long g_max_cache_size = svector::hnsw::DEFAULT_MAX_CACHE_SIZE;
+static auto HNSW_CACHE_VARS = gsv::make_capability({
+    gsv::make_int(
         "cache_mode",
         "How much of the index is served from memory: 0 = none (pages only), "
-        "1 = vectors (decoded vectors cached by VID). Set it globally -- it "
-        "configures a cache the whole index shares.")
-        .default_(svector::hnsw::DEFAULT_CACHE_MODE)
-        .min(svector::hnsw::CACHE_NONE)
+        "1 = vectors (decoded vectors cached by VID). Configures a cache the "
+        "whole index shares.",
+        &g_cache_mode, svector::hnsw::DEFAULT_CACHE_MODE,
+        svector::hnsw::CACHE_NONE,
         // Capped at the highest IMPLEMENTED mode, not CACHE_FULL. The pinned-
         // skeleton modes are declared in the enum but not built yet, and
         // accepting them would silently give mode-1 behaviour -- which would
         // read as "the skeleton bought nothing" in a benchmark. Raise this as
         // each mode lands.
-        .max(svector::hnsw::MAX_IMPLEMENTED_CACHE_MODE),
-    ssv::make_int(
+        svector::hnsw::MAX_IMPLEMENTED_CACHE_MODE),
+    gsv::make_int(
         "max_cache_size",
-        "Upper limit in bytes for one index's vector cache. Set it globally -- "
-        "it configures a cache the whole index shares.")
-        .default_(svector::hnsw::DEFAULT_MAX_CACHE_SIZE)
-        .min(svector::hnsw::MIN_MAX_CACHE_SIZE)
-        .max(svector::hnsw::MAX_MAX_CACHE_SIZE),
-});
-static auto HNSW_CACHE_MODE = HNSW_CACHE_VARS.int_var("cache_mode");
-static auto HNSW_MAX_CACHE_SIZE = HNSW_CACHE_VARS.int_var("max_cache_size");
+        "Upper limit in bytes for one index's vector cache. Configures a cache "
+        "the whole index shares.",
+        &g_max_cache_size, svector::hnsw::DEFAULT_MAX_CACHE_SIZE,
+        svector::hnsw::MIN_MAX_CACHE_SIZE,
+        svector::hnsw::MAX_MAX_CACHE_SIZE)});
 
 namespace svector::hnsw {
 long long read_ef_search() {
@@ -948,17 +951,11 @@ long long read_ef_search() {
   return v;
 }
 
-long long read_cache_mode() {
-  long long v = DEFAULT_CACHE_MODE;
-  HNSW_CACHE_MODE.read(v);
-  return v;
-}
+// The server writes both straight into their storage, so a read is a plain
+// load of a global rather than a per-session lookup.
+long long read_cache_mode() { return g_cache_mode; }
 
-long long read_max_cache_size() {
-  long long v = DEFAULT_MAX_CACHE_SIZE;
-  HNSW_MAX_CACHE_SIZE.read(v);
-  return v;
-}
+long long read_max_cache_size() { return g_max_cache_size; }
 } // namespace svector::hnsw
 
 // Search-cost instrumentation, exposed via SHOW STATUS. Both are monotonic
@@ -985,7 +982,9 @@ static auto HNSW_STATUS_VARS = sv::make_capability({
     sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
     sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
     sv::make_int("cache_evictions", &svector::hnsw::vcache_evictions),
-    sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes)});
+    sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes),
+    sv::make_int("cache_limit_changes", &svector::hnsw::vcache_limit_changes),
+    sv::make_int("cache_limit_slots", &svector::hnsw::vcache_limit_slots)});
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
