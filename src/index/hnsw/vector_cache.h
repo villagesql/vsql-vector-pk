@@ -43,30 +43,42 @@
 // design (the paged path must copy, because its bytes live under a page latch
 // that has to be released before the distance loop runs; a cache entry has no
 // latch, so it can be read where it lies). For that to be sound, an entry must
-// not move or be freed while a caller holds a pointer into it. Today:
+// hold the vector the caller asked for until it stops reading it. Today:
 //
-//   - std::list keeps node addresses stable across insert and erase of OTHER
-//     elements, and get()'s splice() relinks without moving, so an entry's
-//     address is stable for its whole residency.
-//   - entries are evicted or invalidated only between queries, never during
-//     one -- which holds because the index is single-threaded throughout, NOT
-//     because anything enforces it.
+//   - the slab is allocated once and never reallocated, and a slot's address
+//     is a fixed stride into it, so an entry's ADDRESS is stable for the whole
+//     life of the cache -- stable even across its own eviction.
+//   - its CONTENTS are not: a slot is reused in place once evicted. Entries
+//     are evicted only between queries, never during one -- which holds
+//     because the index is single-threaded throughout, NOT because anything
+//     enforces it.
 //
 // NOT THREAD-SAFE, and a mutex alone will not fix it. Blockers, worst first:
 //
-//   1. Eviction frees memory a live pointer still refers to. A caller holds
+//   1. Eviction reuses a slot a live pointer still refers to. A caller holds
 //      the QData* across the distance call; if another thread's insert()
-//      evicts that entry, pop_back() frees it -- use-after-free. The pointer
-//      escapes any lock held inside the cache, so locking the cache is not
-//      sufficient. Fixes: pin on read (refcount/epoch, an atomic per access),
-//      defer all eviction to query boundaries (cheap, and close to what the
-//      contract above already claims -- but it has to be enforced in code
-//      rather than asserted in a comment), or copy out and give up the
-//      in-place read.
-//   2. get() mutates the LRU: splice() relinks on every hit, so two concurrent
-//      READERS corrupt the list. A read-only workload is not safe either.
-//   3. IndexStore::vector_cache() creates and resizes lazily; two threads
-//      racing there both construct and one leaks.
+//      evicts that entry, the slot is handed out and overwritten with a
+//      different vector. The slab memory stays valid, so there is no fault to
+//      catch -- the kernel reads a well-formed QData for the wrong vector and
+//      the query silently returns wrong neighbours. The pointer escapes any
+//      lock held inside the cache, so locking the cache is not sufficient.
+//      Fixes: pin on read (refcount/epoch, an atomic per access), defer all
+//      eviction to query boundaries (cheap, and close to what the contract
+//      above already claims -- but it has to be enforced in code rather than
+//      asserted in a comment), or copy out and give up the in-place read.
+//   2. get() writes on a hit: it sets the CLOCK reference bit, so two
+//      concurrent READERS race on that byte. A read-only workload is not safe
+//      either. The race is benign in effect -- a lost bit costs one wrong
+//      second-chance decision -- but it is still a data race.
+//   3. The open-addressed index is mutated in place. insert() claims buckets
+//      and index_erase() repairs the probe run after the hole by reinserting
+//      what follows it, so a reader probing concurrently can walk past a key
+//      that is present and report a miss.
+//   4. IndexStore::vector_cache() creates and resizes lazily; two threads
+//      racing there both construct and one leaks. It also resets the cache
+//      when cache_mode drops to 0, freeing the slab under anyone still
+//      reading from it -- reachable at runtime, since cache_mode is a global
+//      sysvar that takes effect on connections already running.
 //
 // Until those are addressed this is a single-threaded measurement vehicle, not
 // a shippable cache.
@@ -75,8 +87,6 @@
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 
 #include <cstdint>
-#include <list>
-#include <unordered_map>
 #include <vector>
 
 #include "../../quantize.h"
@@ -158,9 +168,9 @@ private:
   std::vector<Meta> m_meta;
   uint32_t m_hand = 0;
 
-  // OPEN-ADDRESSED INDEX, vid -> slot. Replaces std::unordered_map, whose
-  // chaining costs two dependent cache misses per probe (bucket array, then
-  // the chain node). This is one flat array of {vid, slot}: linear probing
+  // OPEN-ADDRESSED INDEX, vid -> slot. A chaining map (std::unordered_map)
+  // costs two dependent cache misses per probe: the bucket array, then the
+  // chain node. This is one flat array of {vid, slot}: linear probing
   // keeps the common case to a single miss, and probes that do collide land on
   // the same cache line. Power-of-two sized and kept at <= 50% load so probe
   // runs stay short.
