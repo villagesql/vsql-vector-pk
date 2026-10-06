@@ -83,6 +83,12 @@ enum CacheMode : long long {
 
 inline constexpr long long DEFAULT_CACHE_MODE = CACHE_NONE;
 
+// The highest mode actually implemented. CACHE_LAYERS and CACHE_FULL are
+// declared above because they are the designs being evaluated, but neither is
+// built: the sysvar refuses them rather than silently falling back to
+// CACHE_VECTORS, which would make a benchmark of them look like a null result.
+inline constexpr long long MAX_IMPLEMENTED_CACHE_MODE = CACHE_VECTORS;
+
 // Default and bounds for vsql_vector.max_cache_size (bytes, per index).
 // MariaDB's equivalent mhnsw_max_cache_size defaults to 16 MB, which is far
 // too small for any real index -- 512 MB holds the whole 60k x 784 benchmark

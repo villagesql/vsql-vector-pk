@@ -790,7 +790,12 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
 // function. Creating the cache lazily also means an index queried only in
 // CACHE_NONE mode never allocates one.
 VectorCache *IndexStore::vector_cache() {
-  if (read_cache_mode() < CACHE_VECTORS) {
+  const long long mode = read_cache_mode();
+  // Only CACHE_VECTORS is implemented; the sysvar refuses anything higher
+  // (MAX_IMPLEMENTED_CACHE_MODE), so this is the whole mapping today. When the
+  // pinned-skeleton modes land they branch here.
+  assert(mode <= MAX_IMPLEMENTED_CACHE_MODE);
+  if (mode < CACHE_VECTORS) {
     // Mode turned off under a cache that already exists: drop it, so the
     // memory is returned rather than held for a mode nobody is using.
     m_vector_cache.reset();
