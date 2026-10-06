@@ -920,13 +920,16 @@ static auto HNSW_CACHE_VARS = ssv::make_capability({
     ssv::make_int(
         "cache_mode",
         "How much of the index is served from memory: 0 = none (pages only), "
-        "1 = vectors (decoded vectors cached by VID), 2 = layers (upper levels "
-        "pinned in memory, level 0 from pages), 3 = full (every level pinned). "
-        "Higher modes are faster but hold more memory. Set it globally -- it "
+        "1 = vectors (decoded vectors cached by VID). Set it globally -- it "
         "configures a cache the whole index shares.")
         .default_(svector::hnsw::DEFAULT_CACHE_MODE)
         .min(svector::hnsw::CACHE_NONE)
-        .max(svector::hnsw::CACHE_FULL),
+        // Capped at the highest IMPLEMENTED mode, not CACHE_FULL. The pinned-
+        // skeleton modes are declared in the enum but not built yet, and
+        // accepting them would silently give mode-1 behaviour -- which would
+        // read as "the skeleton bought nothing" in a benchmark. Raise this as
+        // each mode lands.
+        .max(svector::hnsw::MAX_IMPLEMENTED_CACHE_MODE),
     ssv::make_int(
         "max_cache_size",
         "Upper limit in bytes for one index's vector cache. Set it globally -- "
