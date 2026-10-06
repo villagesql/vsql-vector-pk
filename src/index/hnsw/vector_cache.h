@@ -42,46 +42,65 @@
 // straight to the distance kernel, with no copy. That is the point of the
 // design (the paged path must copy, because its bytes live under a page latch
 // that has to be released before the distance loop runs; a cache entry has no
-// latch, so it can be read where it lies). For that to be sound, an entry must
-// hold the vector the caller asked for until it stops reading it. Today:
+// latch, so it can be read where it lies).
 //
-//   - the slab is allocated once and never reallocated, and a slot's address
-//     is a fixed stride into it, so an entry's ADDRESS is stable for the whole
-//     life of the cache -- stable even across its own eviction.
-//   - its CONTENTS are not: a slot is reused in place once evicted. Entries
-//     are evicted only between queries, never during one -- which holds
-//     because the index is single-threaded throughout, NOT because anything
-//     enforces it.
+// FILL ONCE. A slot is written exactly once, when it is filled, and is never
+// rewritten. Once the cache is full it stops admitting: a miss is quantized
+// into scratch and handed back without becoming resident. Nothing is evicted
+// to make room for anything else. So an entry's address AND its contents are
+// stable for the life of the cache, and a QData* stays valid until the whole
+// cache is torn down.
 //
-// NOT THREAD-SAFE, and a mutex alone will not fix it. Blockers, worst first:
+// Why not a replacement policy: measured on GCP at 60k x 784 (92 MB working
+// set), an evicting cache held below that set runs at 0.66x of no cache at
+// all -- the miss path, the quantize and the eviction are paid on top of the
+// page read that happens anyway, for a hit rate too low to pay for them. Above
+// the working set it never evicted at all. There is no budget at which
+// replacement earned its cost, so the policy is to fill what fits and leave
+// the rest to the paged path. Recency is also a poor predictor here: every
+// query enters at the same top-layer points and fans out along different
+// paths, so a leaf's recency says little about the next query.
 //
-//   1. Eviction reuses a slot a live pointer still refers to. A caller holds
-//      the QData* across the distance call; if another thread's insert()
-//      evicts that entry, the slot is handed out and overwritten with a
-//      different vector. The slab memory stays valid, so there is no fault to
-//      catch -- the kernel reads a well-formed QData for the wrong vector and
-//      the query silently returns wrong neighbours. The pointer escapes any
-//      lock held inside the cache, so locking the cache is not sufficient.
-//      Fixes: pin on read (refcount/epoch, an atomic per access), defer all
-//      eviction to query boundaries (cheap, and close to what the contract
-//      above already claims -- but it has to be enforced in code rather than
-//      asserted in a comment), or copy out and give up the in-place read.
-//   2. get() writes on a hit: it sets the CLOCK reference bit, so two
-//      concurrent READERS race on that byte. A read-only workload is not safe
-//      either. The race is benign in effect -- a lost bit costs one wrong
-//      second-chance decision -- but it is still a data race.
-//   3. The open-addressed index is mutated in place. insert() claims buckets
-//      and index_erase() repairs the probe run after the hole by reinserting
-//      what follows it, so a reader probing concurrently can walk past a key
-//      that is present and report a miss.
-//   4. IndexStore::vector_cache() creates and resizes lazily; two threads
-//      racing there both construct and one leaks. It also resets the cache
-//      when cache_mode drops to 0, freeing the slab under anyone still
-//      reading from it -- reachable at runtime, since cache_mode is a global
-//      sysvar that takes effect on connections already running.
+// MIXED FORMS ARE DELIBERATE. A vector the cache refused is compared in f32,
+// one it holds is compared in int16, within the same search. The alternative --
+// quantizing a refused vector so every comparison matches -- measured WORSE
+// than having no cache at all once the cache is full: the quantize is paid on
+// every read and immediately thrown away, which at a quarter of the working
+// set cost 3.6x on build and 0.41x on queries. Choosing the kernel per
+// comparison instead brings that to 0.92x of no cache, degrading gracefully
+// rather than falling off.
 //
-// Until those are addressed this is a single-threaded measurement vehicle, not
-// a shippable cache.
+// What it gives up is that a distance no longer depends only on the two
+// vectors: which kernel ran depends on what happened to be resident. int16
+// error here is ~1e-4 relative, far below the gaps that decide neighbour
+// ordering, and recall measured identical (1.0000) at every budget from a
+// quarter of the working set to eight times it -- but two near-equidistant
+// candidates could in principle order differently than they would have.
+//
+// Invalidate retires a slot rather than recycling it: the resident set only
+// ever shrinks between rebuilds. It is not a delete path -- DELETE/UPDATE of a
+// vector are unsupported -- its callers are VID-reuse guards on the write
+// path, so query-only work never tombstones anything.
+//
+// STILL NOT THREAD-SAFE, though fill-once removes most of what made it unsafe.
+// A slot is never rewritten and get() no longer writes at all, so a reader
+// holding a QData* is sound and concurrent readers of a FULL cache do not race.
+// What remains:
+//
+//   1. Filling mutates. insert() claims a slot and an index bucket, so a
+//      reader probing while another thread fills can see a half-published
+//      bucket. Only while the cache is below capacity -- but that includes
+//      every query until it fills.
+//   2. invalidate() retires an entry a reader may be about to probe for.
+//      Rare, and on the write path, but unsynchronized.
+//   3. IndexStore::vector_cache() creates and drops the cache lazily; two
+//      threads racing there both construct and one leaks, and dropping it on
+//      cache_mode=0 frees the slab under anyone still reading -- reachable,
+//      since cache_mode is a global sysvar that takes effect on connections
+//      already running.
+//
+// Closing those needs a guard on construction and on the fill path, not a pin
+// or an epoch on the read path. Until then this stays single-threaded.
 
 #ifndef VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
@@ -106,19 +125,20 @@ public:
   const quant::QData *get(VID vid);
 
   // Quantize `dim` floats at `src` and make the result resident for vid,
-  // returning it. Evicts if that would exceed the budget. Returns the entry
-  // even when the budget is too small to retain it, so the caller always gets
-  // an operand back.
+  // returning the entry. Returns NULLPTR when the cache is full: nothing is
+  // evicted to make room, so the caller must quantize into its own buffer
+  // instead. A refusal is not an error.
   const quant::QData *insert(VID vid, const float *src);
 
   // Drop one entry (its VID was freed and may be reused) or everything.
   void invalidate(VID vid);
   void clear();
 
-  // Change the budget. Shrinking evicts down to it; growing does not reallocate
-  // the slab, so the new ceiling takes effect only up to the capacity the cache
-  // was built with.
-  void set_max_bytes(size_t max_bytes);
+  // Note a budget change. Returns true when the budget actually differs, which
+  // means this cache must be REPLACED -- the slab is sized once at construction
+  // and its slots never move, so a budget cannot be applied in place. The owner
+  // drops the cache and builds one at the new size.
+  bool set_max_bytes(size_t max_bytes);
 
   uint32_t dim() const { return m_dim; }
   uint32_t padded_dim() const { return m_padded_dim; }
@@ -142,31 +162,24 @@ private:
   // to m_capacity.
   uint32_t m_limit = 0;
   uint32_t m_live = 0;      // slots currently occupied
-  uint32_t m_used = 0;      // high-water mark: slots ever handed out
-  // Slots freed by invalidate(). An invalidated slot is NOT compacted away by
-  // moving another entry into it -- that would relocate bytes a caller may
-  // still be pointing at -- so it is parked here and reused in place.
-  std::vector<uint32_t> m_free;
+  // Slots ever handed out. Only ever grows, and never past m_limit: a retired
+  // slot is not returned for reuse, so this is the admission cursor rather
+  // than a high-water mark.
+  uint32_t m_used = 0;
 
   quant::QData *slot_data(uint32_t slot) {
     return reinterpret_cast<quant::QData *>(m_slab.data() +
                                             size_t{slot} * m_entry_bytes);
   }
 
-  // CLOCK eviction, not LRU. An exact LRU relinks a list node on every hit --
-  // six pointer writes across three scattered nodes -- and a profile put that
-  // splice at 8.5% of query time while the ordering it maintained was never
-  // read, because nothing had been evicted. CLOCK sets one byte in a cache
-  // line the caller has just touched, and approximates LRU well enough: the
-  // hand sweeps, clearing `referenced` on entries that have been used and
-  // evicting the first that has not (second chance).
+  // Per-slot bookkeeping. No recency or reference bit: nothing is ever chosen
+  // for replacement, so there is no ordering to maintain and get() stays a
+  // pure read.
   struct Meta {
     uint64_t vid = 0;
     bool occupied = false;
-    bool referenced = false;
   };
   std::vector<Meta> m_meta;
-  uint32_t m_hand = 0;
 
   // OPEN-ADDRESSED INDEX, vid -> slot. A chaining map (std::unordered_map)
   // costs two dependent cache misses per probe: the bucket array, then the
@@ -181,8 +194,11 @@ private:
   // the low bits of a ref are slot indices that repeat across pages, and
   // libstdc++'s std::hash<uint64_t> is the identity, so the raw key clusters
   // badly.
+  // 0 == never used, kTombstone == retired. VID::INVALID is 0, so neither
+  // sentinel can collide with a real key.
+  static constexpr uint64_t kTombstone = ~uint64_t{0};
   struct Bucket {
-    uint64_t vid = 0;  // 0 == empty; VID::INVALID is 0 so this is unambiguous
+    uint64_t vid = 0;
     uint32_t slot = 0;
   };
   std::vector<Bucket> m_index;
@@ -203,16 +219,7 @@ private:
   Bucket *probe(uint64_t vid);
   void index_insert(uint64_t vid, uint32_t slot);
   void index_erase(uint64_t vid);
-  // Linear probing leaves a hole on erase that would cut a probe run short, so
-  // the run after the hole is reinserted.
-  void index_repair_from(uint64_t start);
 
-  // Evict one slot via the CLOCK hand. Returns the freed slot.
-  uint32_t evict_one();
-
-  // Scratch for an insert that cannot be retained (budget smaller than one
-  // entry), so the caller still gets a usable operand.
-  std::vector<unsigned char> m_scratch;
 
   size_t m_max_bytes;
   const uint32_t m_dim;

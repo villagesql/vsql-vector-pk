@@ -84,6 +84,19 @@ public:
     m_quantized = true;
     m_padded_dim = padded_dim;
   }
+
+  // Record the quantized form of the fixed operand, produced once per search
+  // by quantize_operand(). Held so a comparison against a CACHED vector can
+  // use it while one against an uncached vector still uses the f32 decode --
+  // the two forms of operand a coexist for the whole search.
+  // `f32_src` is the encoded form of the same vector, so eval() can recognise
+  // that an operand handed to it IS this prepared one rather than some node's
+  // bytes that merely happen to be unquantized.
+  void set_quantized_fixed_operand(const quant::QData *qa,
+                                   const unsigned char *f32_src) {
+    m_qa = qa;
+    m_fixed_f32_src = f32_src;
+  }
   bool quantized() const { return m_quantized; }
 
   // Decode an encoded value into the caller's buffer. Public so the cache fill
@@ -125,21 +138,33 @@ public:
   // it to out. Returns true on error (writes err). err is a non-owning buffer.
   // out is double -- IndexGraph::DistanceType -- taken concretely here to avoid
   // a circular include of graph.h for what is a fixed type.
-  bool eval(const Column::Data &a, const Column::Data &b, double &out,
-            std::span<char> err) {
+  // `b_quantized` says which form operand b is in: true for a vector served
+  // by the cache, false for one read from a page. It is a per-COMPARISON
+  // choice, not a per-index one, so a vector the cache refused costs a page
+  // read and nothing more -- quantizing it only to throw the result away
+  // would make a full cache more expensive than no cache at all.
+  bool eval(const Column::Data &a, const Column::Data &b, bool a_quantized,
+            bool b_quantized, double &out, std::span<char> err) {
     if (m_fn == nullptr) {
       snprintf(err.data(), err.size(),
                "HNSW: distance: unresolved distance function (helper '%s')",
                m_helper_name);
       return true;
     }
-    if (m_quantized) {
-      // Both operands are already the kernel's form -- nothing to decode, no
-      // scratch to copy into, and the per-vector terms (abs2) were folded in
-      // when they were quantized.
+    // The quantized kernel runs only when BOTH operands are already in that
+    // form: either both came from the cache, or b did and a is the external
+    // vector whose quantized copy was prepared once for this search. Any other
+    // combination falls through to the f32 kernel below, which is why a vector
+    // the cache refused costs a page read and nothing more.
+    const quant::QData *qa = nullptr;
+    if (a_quantized) {
+      qa = reinterpret_cast<const quant::QData *>(a.data);
+    } else if (b_quantized && m_qa != nullptr && a.data == m_fixed_f32_src) {
+      qa = m_qa;
+    }
+    if (b_quantized && qa != nullptr) {
       out = quant::dist_squared_l2_q(
-          reinterpret_cast<const quant::QData *>(a.data),
-          reinterpret_cast<const quant::QData *>(b.data), m_padded_dim);
+          qa, reinterpret_cast<const quant::QData *>(b.data), m_padded_dim);
       return false;
     }
 
@@ -194,6 +219,8 @@ private:
 
   // Set by set_quantized(): operands are quant::QData, not encoded bytes.
   bool m_quantized = false;
+  const quant::QData *m_qa = nullptr;
+  const unsigned char *m_fixed_f32_src = nullptr;
   uint32_t m_padded_dim = 0;
   // The bound helper name, kept only when it did not resolve, for eval()'s
   // error message. Same 64-byte cap the server name lookup uses.

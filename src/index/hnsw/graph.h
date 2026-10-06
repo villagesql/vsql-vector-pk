@@ -204,6 +204,10 @@ public:
     // when there is no cache, and then `data` is what the distance uses.
     IndexScanKey::KeyPartData qdata{};
     bool has_qdata = false;
+    // True when `data` holds a quant::QData rather than encoded bytes -- set
+    // for a vector the cache served or admitted. A vector the cache refused
+    // stays encoded, and its comparison runs the f32 kernel.
+    bool quantized = false;
     // The owning row's primary key, stored on the level-0 node: pkey_parts
     // points at num_pkey_parts KeyPartData (one per key column), owned by the
     // caller for the duration of the insert. num_pkey_parts is 0 for internal
@@ -528,13 +532,20 @@ public:
                                 m_ctx.m_error))
       return true;
     data.has_qdata = true;
+    // The f32 form stays in data.data: a comparison against an uncached
+    // vector needs it, so both forms of this operand live for the search.
+    m_dist.set_quantized_fixed_operand(
+        reinterpret_cast<const quant::QData *>(data.qdata.data),
+        data.data.data);
     return false;
   }
 
-  // The operand the kernel should see for a NodeData: its quantized form when
-  // one was prepared, else its encoded bytes.
+  // The operand the kernel should see for a NodeData: always its encoded
+  // bytes. A prepared quantized form is not selected here -- eval() reaches
+  // for it only when the OTHER operand turned out to be quantized, which is a
+  // per-comparison fact this function cannot see.
   static const IndexScanKey::KeyPartData &operand(const NodeData &d) {
-    return d.has_qdata ? d.qdata : d.data;
+    return d.data;
   }
 
 private:

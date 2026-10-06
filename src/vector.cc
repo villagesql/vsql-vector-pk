@@ -976,12 +976,14 @@ static auto HNSW_STATUS_VARS = sv::make_capability({
     // distance_calls per query is the work a given recall was bought with.
     sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded),
-    // Vector cache. hits/(hits+misses) is the hit rate; a rising eviction
-    // count against a flat hit rate means the budget is too small for the
-    // working set. cache_bytes is a gauge, the rest are monotonic.
+    // Vector cache. hits/(hits+misses) is the hit rate; a rising
+    // admissions_refused count means the working set does not fit the budget.
+    // cache_bytes is a gauge, the rest are monotonic.
     sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
     sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
-    sv::make_int("cache_evictions", &svector::hnsw::vcache_evictions),
+    sv::make_int("cache_admissions_refused",
+                 &svector::hnsw::vcache_admissions_refused),
+    sv::make_int("cache_tombstones", &svector::hnsw::vcache_tombstones),
     sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes),
     sv::make_int("cache_limit_changes", &svector::hnsw::vcache_limit_changes),
     sv::make_int("cache_limit_slots", &svector::hnsw::vcache_limit_slots)});

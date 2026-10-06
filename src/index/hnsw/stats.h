@@ -54,7 +54,13 @@ inline long long hnsw_nodes_expanded = 0;
 // --- vector cache --------------------------------------------------------
 inline long long vcache_hits = 0;
 inline long long vcache_misses = 0;
-inline long long vcache_evictions = 0;
+// Misses that found the cache full and were served from scratch instead of
+// becoming resident. The fill-once counterpart of an eviction count: a rising
+// value means the working set does not fit the budget.
+inline long long vcache_admissions_refused = 0;
+// Entries retired by invalidate(). Only the write path tombstones, so this
+// stays flat under query-only work.
+inline long long vcache_tombstones = 0;
 // A gauge, not a monotonic counter: bytes currently resident.
 inline long long vcache_resident_bytes = 0;
 // How the budget is being applied: how many times set_max_bytes() changed the

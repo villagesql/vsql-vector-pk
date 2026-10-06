@@ -110,6 +110,7 @@ bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
       out.data.data = reinterpret_cast<const unsigned char *>(q);
       out.data.length = static_cast<uint32_t>(
           quant::qdata_length(m_vector_cache->padded_dim()));
+      out.quantized = true;
       return false;
     }
   }
@@ -135,9 +136,17 @@ bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
                             m_ctx.m_error))
     return true;
   const quant::QData *q = m_vector_cache->insert(vid, decoded->data);
+  if (q == nullptr) {
+    // The cache is full and refused it. Leave out.data as the encoded bytes
+    // already fetched: the comparison runs the f32 kernel against this vector,
+    // so a refusal costs the page read and nothing else. Quantizing here only
+    // to discard the result would make a full cache slower than no cache.
+    return false;
+  }
   out.data.data = reinterpret_cast<const unsigned char *>(q);
   out.data.length =
       static_cast<uint32_t>(quant::qdata_length(m_vector_cache->padded_dim()));
+  out.quantized = true;
   return false;
 }
 
@@ -151,7 +160,8 @@ bool IndexGraph::distance(const NodeData &a, const NodeData &b,
   // decoded vectors, with operand a's decode reused across a traversal's
   // candidates. All of that -- the resolved kernel, the decode scratch, and the
   // fixed-operand reuse -- lives in m_dist; see distance_evaluator.h.
-  return m_dist.eval(operand(a), operand(b), out, m_ctx.m_error);
+  return m_dist.eval(operand(a), operand(b), a.quantized, b.quantized, out,
+                     m_ctx.m_error);
 }
 
 bool IndexGraph::distance(const Node &a, const Node &b, DistanceType &out) {

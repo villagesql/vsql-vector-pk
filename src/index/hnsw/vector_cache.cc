@@ -70,9 +70,18 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
 
 VectorCache::Bucket *VectorCache::probe(uint64_t vid) {
   uint64_t i = mix(vid) & m_index_mask;
+  Bucket *first_free = nullptr;
   for (;;) {
     Bucket &b = m_index[static_cast<size_t>(i)];
-    if (b.vid == 0 || b.vid == vid) return &b;
+    if (b.vid == vid) return &b;
+    // A tombstone does not end the run -- a key that collided past it is still
+    // further along -- but it is claimable, so remember the first one and hand
+    // it back if the key turns out to be absent.
+    if (b.vid == kTombstone) {
+      if (first_free == nullptr) first_free = &b;
+    } else if (b.vid == 0) {
+      return first_free != nullptr ? first_free : &b;
+    }
     i = (i + 1) & m_index_mask;
   }
 }
@@ -86,24 +95,13 @@ void VectorCache::index_insert(uint64_t vid, uint32_t slot) {
 void VectorCache::index_erase(uint64_t vid) {
   Bucket *b = probe(vid);
   if (b->vid != vid) return;
-  const uint64_t hole = static_cast<uint64_t>(b - m_index.data());
-  b->vid = 0;
-  index_repair_from(hole);
-}
-
-void VectorCache::index_repair_from(uint64_t hole) {
-  // Walk the run after the hole, reinserting each entry. Without this a probe
-  // for a key that collided past the hole would stop at it and report a miss.
-  uint64_t i = (hole + 1) & m_index_mask;
-  for (;;) {
-    Bucket &b = m_index[static_cast<size_t>(i)];
-    if (b.vid == 0) return;
-    const uint64_t vid = b.vid;
-    const uint32_t slot = b.slot;
-    b.vid = 0;
-    index_insert(vid, slot);
-    i = (i + 1) & m_index_mask;
-  }
+  // Leave a tombstone rather than reinserting the run that follows: relocating
+  // a bucket is cheap, but repairing requires rewriting buckets a concurrent
+  // probe may be walking. kTombstone keeps the run intact for lookups while
+  // marking the slot gone; probe() treats it as occupied-but-not-matching.
+  // Tombstones lengthen probe runs as they accumulate, which only a rebuild
+  // clears -- acceptable because nothing erases during query-only work.
+  b->vid = kTombstone;
 }
 
 const quant::QData *VectorCache::get(VID vid) {
@@ -116,75 +114,40 @@ const quant::QData *VectorCache::get(VID vid) {
     stat_add(vcache_misses, 1);
     return nullptr;
   }
-  // CLOCK: one byte in the Meta the probe has already pulled in, rather than
-  // an LRU list splice.
-  m_meta[b->slot].referenced = true;
   stat_add(vcache_hits, 1);
   return slot_data(b->slot);
 }
 
-uint32_t VectorCache::evict_one() {
-  // Second chance: clear `referenced` and move on; evict the first entry the
-  // hand finds without it. An all-referenced sweep clears every bit on the
-  // first pass and evicts on the second, so this terminates.
-  assert(m_live > 0);
-  for (;;) {
-    Meta &m = m_meta[m_hand];
-    const uint32_t slot = m_hand;
-    m_hand = (m_hand + 1) % m_capacity;
-    if (!m.occupied) continue;
-    if (m.referenced) {
-      m.referenced = false;
-      continue;
-    }
-    index_erase(m.vid);
-    m.occupied = false;
-    --m_live;
-    stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
-    stat_add(vcache_evictions, 1);
-    return slot;
-  }
-}
 
 const quant::QData *VectorCache::insert(VID vid, const float *src) {
-  // Budget below one entry: quantize into scratch so the caller still gets an
-  // operand. Nothing becomes resident.
+  // Budget below one entry: nothing can ever become resident, so every insert
+  // is a refusal.
   if (m_capacity == 0) {
-    m_scratch.resize(m_entry_bytes);
-    auto *q = reinterpret_cast<quant::QData *>(m_scratch.data());
-    quant::quantize(src, m_dim, m_padded_dim, q);
-    return q;
+    stat_add(vcache_admissions_refused, 1);
+    return nullptr;
   }
 
-  uint32_t slot;
-  Bucket *b = probe(vid.value);
-  if (b->vid == vid.value) {
-    slot = b->slot;  // already resident: overwrite in place
-  } else if (!m_free.empty()) {
-    slot = m_free.back();  // reuse a slot an invalidate freed
-    m_free.pop_back();
-    m_meta[slot].occupied = true;
-    m_meta[slot].vid = vid.value;
-    ++m_live;
-    stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
-    index_insert(vid.value, slot);
-  } else if (m_used < m_limit) {
-    slot = m_used++;  // slab not yet full: next never-used slot
-    m_meta[slot].occupied = true;
-    m_meta[slot].vid = vid.value;
-    ++m_live;
-    stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
-    index_insert(vid.value, slot);
-  } else {
-    slot = evict_one();
-    m_meta[slot].occupied = true;
-    m_meta[slot].vid = vid.value;
-    ++m_live;
-    stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
-    index_insert(vid.value, slot);
+  // Only ever reached after get() missed, so the vid must not be resident --
+  // a second fill would rewrite a slot a caller may be reading.
+  assert(probe(vid.value)->vid != vid.value);
+
+  if (m_used == m_limit) {
+    // Full. Nothing is evicted to make room: a slot is written once and never
+    // rewritten, which is what keeps a QData* valid for the cache's life.
+    // Report the refusal and let the caller quantize into its OWN buffer --
+    // this cache has no per-caller storage to lend, and two operands are live
+    // at once during a comparison.
+    stat_add(vcache_admissions_refused, 1);
+    return nullptr;
   }
 
-  m_meta[slot].referenced = true;
+  const uint32_t slot = m_used++;
+  m_meta[slot].occupied = true;
+  m_meta[slot].vid = vid.value;
+  ++m_live;
+  stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
+  index_insert(vid.value, slot);
+
   auto *q = slot_data(slot);
   quant::quantize(src, m_dim, m_padded_dim, q);
   return q;
@@ -196,13 +159,12 @@ void VectorCache::invalidate(VID vid) {
   if (b->vid != vid.value) return;
   const uint32_t slot = b->slot;
   index_erase(vid.value);
-  // The slot is NOT compacted away by moving another entry into it: that would
-  // relocate that entry's bytes, and a caller may be holding a pointer to
-  // them. Mark it free and let it be reused in place.
+  // The slot is retired, not recycled: its bytes stay untouched because a
+  // caller may still be reading them, and a later fill takes a fresh slot. So
+  // the resident set only ever shrinks until the cache is rebuilt.
   m_meta[slot].occupied = false;
-  m_meta[slot].referenced = false;
-  m_free.push_back(slot);
   --m_live;
+  stat_add(vcache_tombstones, 1);
   stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
 }
 
@@ -211,24 +173,20 @@ void VectorCache::clear() {
            -static_cast<long long>(size_t{m_live} * m_entry_bytes));
   m_live = 0;
   m_used = 0;
-  m_hand = 0;
-  m_free.clear();
   std::fill(m_meta.begin(), m_meta.end(), Meta{});
   std::fill(m_index.begin(), m_index.end(), Bucket{});
 }
 
-void VectorCache::set_max_bytes(size_t max_bytes) {
-  if (max_bytes == m_max_bytes) return;  // called per scan; usually a no-op
-  m_max_bytes = max_bytes;
-  // The slab is not reallocated -- that would move every slot and invalidate
-  // pointers callers hold -- so the budget moves m_limit within the capacity
-  // already built. Lowering it evicts down to the new ceiling; raising it
-  // takes effect only up to m_capacity.
-  m_limit = std::min(static_cast<uint32_t>(m_max_bytes / m_entry_bytes),
-                     m_capacity);
+bool VectorCache::set_max_bytes(size_t max_bytes) {
+  if (max_bytes == m_max_bytes) return false;  // called per scan; usually a no-op
+  // A budget change is a rebuild, not a resize. The slab is sized once at
+  // construction and its slots never move, so there is no in-place way to
+  // honour a raise: the caller drops this cache and builds one at the new
+  // size. Returning rather than resizing keeps that decision with the owner,
+  // which is the only place that knows no reader holds an entry.
   stat_add(vcache_limit_changes, 1);
-  vcache_limit_slots = m_limit;
-  while (m_live > m_limit && m_live > 0) evict_one();
+  vcache_limit_slots = static_cast<long long>(max_bytes / m_entry_bytes);
+  return true;
 }
 
 } // namespace svector::hnsw

@@ -806,11 +806,15 @@ VectorCache *IndexStore::vector_cache(uint32_t dim) {
     m_vector_cache.reset();
     return nullptr;
   }
+  // A budget change cannot be applied to a live cache -- slots are sized and
+  // placed once -- so it is honoured by replacing the cache. Dropping it here
+  // is safe for the same reason the rest of the cache is: this runs at the
+  // start of a scan, before any entry pointer has been handed out.
+  if (m_vector_cache != nullptr && m_vector_cache->set_max_bytes(budget))
+    m_vector_cache.reset();
   if (m_vector_cache == nullptr)
     m_vector_cache = std::make_unique<VectorCache>(
         budget, dim, quant::qvector_padded_dim(dim));
-  else
-    m_vector_cache->set_max_bytes(budget);
   return m_vector_cache.get();
 }
 
