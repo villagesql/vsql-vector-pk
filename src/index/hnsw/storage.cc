@@ -785,6 +785,37 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
   }
 }
 
+// The mode and the budget are read per call rather than captured, so a later
+// move from a session variable to a per-index setting touches only this
+// function. Creating the cache lazily also means an index queried only in
+// CACHE_NONE mode never allocates one.
+VectorCache *IndexStore::vector_cache() {
+  if (read_cache_mode() < CACHE_VECTORS) {
+    // Mode turned off under a cache that already exists: drop it, so the
+    // memory is returned rather than held for a mode nobody is using.
+    m_vector_cache.reset();
+    return nullptr;
+  }
+  const auto budget = static_cast<size_t>(read_max_cache_size());
+  if (budget == 0) {
+    m_vector_cache.reset();
+    return nullptr;
+  }
+  if (m_vector_cache == nullptr)
+    m_vector_cache = std::make_unique<VectorCache>(budget);
+  else
+    m_vector_cache->set_max_bytes(budget);
+  return m_vector_cache.get();
+}
+
+void IndexStore::invalidate_vector_cache(VID vid) {
+  if (m_vector_cache != nullptr) m_vector_cache->invalidate(vid);
+}
+
+void IndexStore::clear_vector_cache() {
+  if (m_vector_cache != nullptr) m_vector_cache->clear();
+}
+
 bool IndexStore::create(const PkLayout &pk_layout, Space::Ref space_ref,
                         Segment::TrxRef trx_ref, const Options &opts, char *err,
                         uint32_t err_len) {
@@ -958,6 +989,13 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   if (GraphOperations<IndexGraph>(graph).insert(node_data, top_node))
     return true;
 
+  // Belt and braces against a reused VID: purge() invalidates on the way out,
+  // but a VID freed in a session that never ran a purge through this cache --
+  // or freed before the cache existed -- would otherwise serve the previous
+  // occupant's vector. Dropping the entry for a VID we have just written costs
+  // one hash erase per insert.
+  ctx->user()->invalidate_vector_cache(top_node.vid);
+
   *key_ref = static_cast<IndexScanKey::KeyPartRef>(top_node.nid.value);
   return false;
 }
@@ -1014,6 +1052,10 @@ bool purge(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   if (level_store->resolve_owner(nid, target, err, err_len))
     return true;
 
+  // The VID is about to be freed and can be handed to a later insert, which
+  // would otherwise be served this vector's bytes from the cache.
+  store->invalidate_vector_cache(target.vid);
+
   IndexGraph graph(*store, index, trx_ref,
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
@@ -1032,6 +1074,9 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
   IndexGraph graph(*ctx->user(), index, Segment::TrxRef{},
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
+  // Cache is owned by the store, so it outlives this per-scan graph and the
+  // next query sees what this one loaded. Null in CACHE_NONE.
+  graph.set_vector_cache(ctx->user()->vector_cache());
 
   IndexGraph::NodeData query{scan_desc[0][VECTOR_KEY_POS]};
   const uint32_t k = scan_desc.limit();

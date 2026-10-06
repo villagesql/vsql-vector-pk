@@ -42,6 +42,7 @@
 
 #include "distance_registry.h"
 #include "index/hnsw/layer_ops.h"
+#include "index/hnsw/vector_cache.h"
 #include "index/hnsw/storage.h"
 #include "native_vector.h"
 #include "storage/storage.h"
@@ -900,13 +901,42 @@ static auto HNSW_SESSION_VARS = ssv::make_capability({
         .default_(svector::hnsw::DEFAULT_EF_SEARCH)
         .min(svector::hnsw::MIN_EF_SEARCH)
         .max(svector::hnsw::MAX_EF_SEARCH),
+    ssv::make_int(
+        "cache_mode",
+        "How much of the index is served from memory: 0 = none (pages only), "
+        "1 = vectors (decoded vectors cached by VID), 2 = layers (upper levels "
+        "pinned in memory, level 0 from pages), 3 = full (every level pinned). "
+        "Higher modes are faster but hold more memory.")
+        .default_(svector::hnsw::DEFAULT_CACHE_MODE)
+        .min(svector::hnsw::CACHE_NONE)
+        .max(svector::hnsw::CACHE_FULL),
+    ssv::make_int(
+        "max_cache_size",
+        "Upper limit in bytes for one index's vector cache.")
+        .default_(svector::hnsw::DEFAULT_MAX_CACHE_SIZE)
+        .min(svector::hnsw::MIN_MAX_CACHE_SIZE)
+        .max(svector::hnsw::MAX_MAX_CACHE_SIZE),
 });
 static auto HNSW_EF_SEARCH = HNSW_SESSION_VARS.int_var("ef_search");
+static auto HNSW_CACHE_MODE = HNSW_SESSION_VARS.int_var("cache_mode");
+static auto HNSW_MAX_CACHE_SIZE = HNSW_SESSION_VARS.int_var("max_cache_size");
 
 namespace svector::hnsw {
 long long read_ef_search() {
   long long v = DEFAULT_EF_SEARCH;
   HNSW_EF_SEARCH.read(v);
+  return v;
+}
+
+long long read_cache_mode() {
+  long long v = DEFAULT_CACHE_MODE;
+  HNSW_CACHE_MODE.read(v);
+  return v;
+}
+
+long long read_max_cache_size() {
+  long long v = DEFAULT_MAX_CACHE_SIZE;
+  HNSW_MAX_CACHE_SIZE.read(v);
   return v;
 }
 } // namespace svector::hnsw
@@ -926,7 +956,11 @@ long long read_ef_search() {
 namespace sv = vsql::preview_status_var;
 static auto HNSW_STATUS_VARS = sv::make_capability(
     {sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
-     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded)});
+     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded),
+     sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
+     sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
+     sv::make_int("cache_evictions", &svector::hnsw::vcache_evictions),
+     sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes)});
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()

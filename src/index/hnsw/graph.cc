@@ -101,14 +101,34 @@ IndexGraph::IndexGraph(IndexStore &store, const Index &index,
 bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
   assert(vid.is_valid());
 
+  // Cache hit: point straight at the resident bytes. Note the address is
+  // STABLE per vid, unlike the scratch buffer below -- so a hit is safe for
+  // the evaluator's pointer-keyed decoded-operand reuse, where the scratch
+  // path is not. The callers invalidate conservatively either way.
+  if (m_vector_cache != nullptr) {
+    VectorCache::Entry e;
+    if (m_vector_cache->get(vid, e)) {
+      out.data.data = e.data;
+      out.data.length = e.length;
+      return false;
+    }
+  }
+
   // The server fills the vector data into the buffer it is handed, so out
   // arrives pointing at buf, sized from the indexed column's maximum length --
   // which every stored vector fits in by construction.
   out.data.data = reinterpret_cast<const unsigned char *>(buf.data());
   out.data.length = static_cast<uint32_t>(buf.size());
-  return m_index.get_key_data(VECTOR_KEY_POS,
-                              static_cast<IndexScanKey::KeyPartRef>(vid.value),
-                              &out.data);
+  if (m_index.get_key_data(VECTOR_KEY_POS,
+                           static_cast<IndexScanKey::KeyPartRef>(vid.value),
+                           &out.data))
+    return true;
+
+  // Populate on the way back. insert() copies, so the entry does not alias the
+  // scratch buffer the next call will overwrite.
+  if (m_vector_cache != nullptr)
+    m_vector_cache->insert(vid, out.data.data, out.data.length);
+  return false;
 }
 
 bool IndexGraph::distance(const NodeData &a, const NodeData &b,
