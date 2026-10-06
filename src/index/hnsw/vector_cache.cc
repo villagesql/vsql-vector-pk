@@ -30,7 +30,7 @@ bool VectorCache::get(VID vid, Entry &out) {
   auto it = m_map.find(vid.value);
   if (it == m_map.end()) {
     ++m_misses;
-    ++vcache_misses;
+    stat_add(vcache_misses, 1);
     return false;
   }
   // Refresh: move to the front of the LRU. splice() relinks the node without
@@ -40,7 +40,7 @@ bool VectorCache::get(VID vid, Entry &out) {
   out.data = it->second->bytes.data();
   out.length = static_cast<uint32_t>(it->second->bytes.size());
   ++m_hits;
-  ++vcache_hits;
+  stat_add(vcache_hits, 1);
   return true;
 }
 
@@ -54,7 +54,7 @@ void VectorCache::insert(VID vid, const unsigned char *data, uint32_t length) {
   if (it != m_map.end()) {
     // Already resident (a concurrent-ish re-fetch, or a stale entry the caller
     // re-read): replace in place rather than growing a duplicate.
-    vcache_resident_bytes -= static_cast<long long>(it->second->bytes.size());
+    stat_add(vcache_resident_bytes, -static_cast<long long>(it->second->bytes.size()));
     m_bytes -= it->second->bytes.size();
     m_lru.erase(it->second);
     m_map.erase(it);
@@ -65,20 +65,20 @@ void VectorCache::insert(VID vid, const unsigned char *data, uint32_t length) {
   m_lru.push_front(Node{vid, std::vector<unsigned char>(data, data + length)});
   m_map.emplace(vid.value, m_lru.begin());
   m_bytes += length;
-  vcache_resident_bytes += static_cast<long long>(length);
+  stat_add(vcache_resident_bytes, static_cast<long long>(length));
 }
 
 void VectorCache::invalidate(VID vid) {
   auto it = m_map.find(vid.value);
   if (it == m_map.end()) return;
-  vcache_resident_bytes -= static_cast<long long>(it->second->bytes.size());
+  stat_add(vcache_resident_bytes, -static_cast<long long>(it->second->bytes.size()));
   m_bytes -= it->second->bytes.size();
   m_lru.erase(it->second);
   m_map.erase(it);
 }
 
 void VectorCache::clear() {
-  vcache_resident_bytes -= static_cast<long long>(m_bytes);
+  stat_add(vcache_resident_bytes, -static_cast<long long>(m_bytes));
   m_lru.clear();
   m_map.clear();
   m_bytes = 0;
@@ -92,8 +92,8 @@ void VectorCache::set_max_bytes(size_t max_bytes) {
 void VectorCache::evict_to_fit(size_t incoming) {
   while (m_bytes + incoming > m_max_bytes && !m_lru.empty()) {
     auto &victim = m_lru.back();
-    vcache_resident_bytes -= static_cast<long long>(victim.bytes.size());
-    ++vcache_evictions;
+    stat_add(vcache_resident_bytes, -static_cast<long long>(victim.bytes.size()));
+    stat_add(vcache_evictions, 1);
     m_bytes -= victim.bytes.size();
     m_map.erase(victim.vid.value);
     m_lru.pop_back();

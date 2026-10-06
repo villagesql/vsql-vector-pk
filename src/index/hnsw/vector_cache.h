@@ -52,17 +52,9 @@
 #include <vector>
 
 #include "hnsw.h"
+#include "stats.h"
 
 namespace svector::hnsw {
-
-// Process-wide cache counters, exposed as status variables so a workload's hit
-// rate can be read with SHOW GLOBAL STATUS. Aggregated across every index
-// rather than per-index, which is enough to answer "is the cache working";
-// per-index accounting arrives with the per-index settings.
-inline long long vcache_hits = 0;
-inline long long vcache_misses = 0;
-inline long long vcache_evictions = 0;
-inline long long vcache_resident_bytes = 0;
 
 class VectorCache {
 public:
