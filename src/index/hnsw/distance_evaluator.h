@@ -167,6 +167,14 @@ public:
     // instead (the previous design) measured 3.6x slower on build and 0.41x on
     // queries once the cache was full, because the result was discarded every
     // time.
+    //
+    // TODO(villagesql-indexing): the mixed pair quantizes the uncached operand
+    // and throws the result away. It is the only direction available today --
+    // a cache entry keeps no f32 form, so the alternative is a page fetch to
+    // undo work the cache already did -- but neither side is free. Mixed pairs
+    // only occur while the cache is partially filled, so this is unmeasured at
+    // scale; worth revisiting if a workload sits in that state (a large index
+    // under a budget it never quite fills, or steady growth past a full one).
     if (a_quantized || b_quantized) {
       const quant::QData *qa = nullptr;
       const quant::QData *qb = nullptr;
