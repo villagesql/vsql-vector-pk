@@ -21,27 +21,55 @@
 // along with this program; if not, write to the Free Software
 // Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-// VectorCache: a byte-bounded, VID-keyed cache of encoded vectors, sitting
-// behind IndexGraph::resolve_node_data() -- the single funnel every vector read
-// on the paged search path goes through.
+// VectorCache: a byte-bounded, VID-keyed cache of vectors in the form the
+// distance kernel consumes -- decoded, quantized to int16, with the per-vector
+// terms the metric needs already folded in.
 //
-// Why: profiling the paged path showed the per-neighbour vector fetch (an ABI
-// call into the server, a column-store page lookup and a copy out) as a leading
-// cost, co-equal with the distance math itself. A hit here replaces all of that
-// with a pointer to bytes we already hold.
+// CONTRACT: this cache exists solely to drive graph traversal and candidate
+// ranking inside the index. What it holds is a DERIVED, LOSSY, metric-specific
+// form -- not the stored vector. It must never be read to answer anything the
+// user sees; an entry is an operand for the kernel and nothing else.
 //
-// What it does NOT do: the graph (node records, neighbour lists) stays on
-// pages. This is the vector-only cache mode; the pointer-graph modes are a
-// separate backend.
+// Why not raw bytes: a first version cached the page bytes as fetched, and made
+// queries ~5% SLOWER despite a 99.98% hit rate. A hit replaced a (warm) page
+// fetch with a hash lookup but left every per-call cost in place -- the decode
+// still ran on every distance call, the copy into the evaluator's scratch still
+// happened. Caching the kernel-ready form removes both, and halves the bytes so
+// twice as many vectors fit a given budget.
 //
-// Lifetime contract, which the caller depends on: a cached entry's bytes have a
-// STABLE address for as long as it is resident, and entries are only ever
-// evicted or invalidated between queries, never during one. That matters
-// because DistanceEvaluator keys its decoded-operand reuse on the source
-// pointer -- see resolve_node_data().
+// LIFETIME CONTRACT the caller depends on: get()/insert() return a pointer to
+// an entry that the caller then reads in place -- resolve_node_data() hands it
+// straight to the distance kernel, with no copy. That is the point of the
+// design (the paged path must copy, because its bytes live under a page latch
+// that has to be released before the distance loop runs; a cache entry has no
+// latch, so it can be read where it lies). For that to be sound, an entry must
+// not move or be freed while a caller holds a pointer into it. Today:
 //
-// NOT thread-safe. Single-threaded use only, matching the rest of the index
-// today; concurrency lands with the wider productionization work.
+//   - std::list keeps node addresses stable across insert and erase of OTHER
+//     elements, and get()'s splice() relinks without moving, so an entry's
+//     address is stable for its whole residency.
+//   - entries are evicted or invalidated only between queries, never during
+//     one -- which holds because the index is single-threaded throughout, NOT
+//     because anything enforces it.
+//
+// NOT THREAD-SAFE, and a mutex alone will not fix it. Blockers, worst first:
+//
+//   1. Eviction frees memory a live pointer still refers to. A caller holds
+//      the QData* across the distance call; if another thread's insert()
+//      evicts that entry, pop_back() frees it -- use-after-free. The pointer
+//      escapes any lock held inside the cache, so locking the cache is not
+//      sufficient. Fixes: pin on read (refcount/epoch, an atomic per access),
+//      defer all eviction to query boundaries (cheap, and close to what the
+//      contract above already claims -- but it has to be enforced in code
+//      rather than asserted in a comment), or copy out and give up the
+//      in-place read.
+//   2. get() mutates the LRU: splice() relinks on every hit, so two concurrent
+//      READERS corrupt the list. A read-only workload is not safe either.
+//   3. IndexStore::vector_cache() creates and resizes lazily; two threads
+//      racing there both construct and one leaks.
+//
+// Until those are addressed this is a single-threaded measurement vehicle, not
+// a shippable cache.
 
 #ifndef VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
@@ -51,6 +79,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../../quantize.h"
 #include "hnsw.h"
 #include "stats.h"
 
@@ -58,55 +87,63 @@ namespace svector::hnsw {
 
 class VectorCache {
 public:
-  // A resident entry's bytes, as handed back to the caller. Valid until the
-  // entry is evicted or invalidated (see the lifetime contract above).
-  struct Entry {
-    const unsigned char *data = nullptr;
-    uint32_t length = 0;
-  };
+  // `padded_dim` is the quantized vector length every entry is built to (see
+  // quant::qvector_padded_dim); the kernel requires it to be uniform, so it is
+  // fixed for the cache's lifetime rather than carried per entry.
+  VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
+      : m_max_bytes(max_bytes), m_dim(dim), m_padded_dim(padded_dim),
+        m_entry_bytes(quant::qdata_length(padded_dim)) {}
 
-  explicit VectorCache(size_t max_bytes) : m_max_bytes(max_bytes) {}
+  // Look up vid. Returns the resident QData, or nullptr on a miss; the LRU
+  // position is refreshed on a hit.
+  const quant::QData *get(VID vid);
 
-  // Look up vid. On a hit, fills out and returns true; the LRU position is
-  // refreshed. On a miss, leaves out untouched and returns false -- the caller
-  // fetches and then calls insert().
-  bool get(VID vid, Entry &out);
+  // Quantize `dim` floats at `src` and make the result resident for vid,
+  // returning it. Evicts least-recently-used entries first if that would
+  // exceed the budget. Returns the entry even when the budget is too small to
+  // retain it, so the caller always gets an operand back.
+  const quant::QData *insert(VID vid, const float *src);
 
-  // Make vid resident with a copy of [data, data+length). Evicts least-recently
-  // used entries first if that would exceed the budget. A vector larger than
-  // the whole budget is simply not cached (and not an error: the caller already
-  // holds the bytes it fetched).
-  void insert(VID vid, const unsigned char *data, uint32_t length);
-
-  // Drop one entry (a row's vector changed) or everything (the index changed
-  // under us, or the budget was reduced).
+  // Drop one entry (its VID was freed and may be reused) or everything.
   void invalidate(VID vid);
   void clear();
 
   // Change the budget, evicting down to it if it shrank.
   void set_max_bytes(size_t max_bytes);
 
+  uint32_t dim() const { return m_dim; }
+  uint32_t padded_dim() const { return m_padded_dim; }
   size_t resident_bytes() const { return m_bytes; }
   size_t entries() const { return m_map.size(); }
-  uint64_t hits() const { return m_hits; }
-  uint64_t misses() const { return m_misses; }
 
 private:
   struct Node {
     VID vid;
+    // A QData with its flexible dims[] array, so one allocation per entry.
     std::vector<unsigned char> bytes;
+    quant::QData *qdata() {
+      return reinterpret_cast<quant::QData *>(bytes.data());
+    }
   };
 
   // MRU at the front. The map points at list nodes, whose addresses std::list
-  // keeps stable across insert and erase of *other* elements -- which is what
+  // keeps stable across insert and erase of OTHER elements -- which is what
   // makes the lifetime contract above hold.
   std::list<Node> m_lru;
   std::unordered_map<uint64_t, std::list<Node>::iterator> m_map;
 
+  // The scratch an insert quantizes into when the entry cannot be retained,
+  // so the caller still gets a usable operand back. Reused; valid only until
+  // the next insert, which is enough because the caller consumes it before
+  // asking for another vector.
+  std::vector<unsigned char> m_scratch;
+
   size_t m_max_bytes;
+  const uint32_t m_dim;
+  const uint32_t m_padded_dim;
+  // Every entry is the same size, since dim is fixed per index.
+  const size_t m_entry_bytes;
   size_t m_bytes = 0;
-  uint64_t m_hits = 0;
-  uint64_t m_misses = 0;
 
   void evict_to_fit(size_t incoming);
 };
