@@ -25,6 +25,7 @@
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_GRAPH_H
 
 #include "distance_evaluator.h"
+#include "vector_cache.h"
 #include "hnsw.h"
 #include "storage.h"
 #include <array>
@@ -482,6 +483,15 @@ private:
   // (m_vector_buf_1/m_vector_buf_2), so the first stays valid while the second
   // is resolved.
   bool resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out);
+
+public:
+  // Attach a vector cache to sit behind resolve_node_data(), or nullptr for
+  // the uncached paged path. Not owned -- it lives on the IndexStore and
+  // outlives any one IndexGraph, which is what lets it persist across queries.
+  void set_vector_cache(VectorCache *cache) { m_vector_cache = cache; }
+
+private:
+  VectorCache *m_vector_cache = nullptr;
 
   // One link in a node's overflow chain: the overflow entry to drop (nid),
   // and the record whose Overflow field currently points to it (prev, of

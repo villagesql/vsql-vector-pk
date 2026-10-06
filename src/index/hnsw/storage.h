@@ -34,6 +34,7 @@
 
 #include "../../storage/storage.h"
 #include "hnsw.h"
+#include "vector_cache.h"
 #include "pk_layout.h"
 #include <villagesql/preview/index_builder.h>
 
@@ -54,6 +55,45 @@ inline constexpr long long MAX_EF_SEARCH = 65536;
 
 // Reads the connection's vsql_vector.ef_search value. Defined in vector.cc.
 long long read_ef_search();
+
+// How much of the index the search serves from memory rather than pages.
+// Ordered by how much is cached, so a > comparison asks "at least this much".
+//
+// A session variable is the wrong home for this -- a cache lives on the
+// IndexStore and is shared by every session, so two connections could disagree
+// about one index's mode. It is a session var for now because that makes the
+// four modes cheap to A/B from the benchmark harness; it ships as a per-index,
+// runtime-mutable setting. Everything reads it through read_cache_mode() at the
+// point of use, so that change is local.
+enum CacheMode : long long {
+  // Everything from pages, no cache. The pre-cache behaviour.
+  CACHE_NONE = 0,
+  // Graph from pages; decoded vectors cached by VID behind
+  // IndexGraph::resolve_node_data(). No memory ceiling -- the cache holds
+  // whatever fits and misses cost a page read.
+  CACHE_VECTORS = 1,
+  // Upper levels (>= 1) served from pinned in-memory nodes with pointer edges;
+  // level 0 from pages + the vector cache. Levels hold ~1/M of the level below,
+  // so the pinned set is ~6% of nodes and bounded.
+  CACHE_LAYERS = 2,
+  // Every level from pinned in-memory nodes. Fastest, but the whole node
+  // skeleton must fit: ~3 GB at 10M rows, ~31 GB at 100M.
+  CACHE_FULL = 3,
+};
+
+inline constexpr long long DEFAULT_CACHE_MODE = CACHE_NONE;
+
+// Default and bounds for vsql_vector.max_cache_size (bytes, per index).
+// MariaDB's equivalent mhnsw_max_cache_size defaults to 16 MB, which is far
+// too small for any real index -- 512 MB holds the whole 60k x 784 benchmark
+// set with room to spare.
+inline constexpr long long DEFAULT_MAX_CACHE_SIZE = 512LL * 1024 * 1024;
+inline constexpr long long MIN_MAX_CACHE_SIZE = 0;
+inline constexpr long long MAX_MAX_CACHE_SIZE = 1LL << 44;  // 16 TB
+
+// Read the connection's cache settings. Defined in vector.cc.
+long long read_cache_mode();
+long long read_max_cache_size();
 
 // Options parsed from WITH (...) at CREATE INDEX time.
 struct Options {
@@ -554,7 +594,23 @@ private:
   // store), fixed at create/load from the key shape.
   PkLayout m_pk_layout;
 
+  // Vector cache for the paged search path, created on first use if the mode
+  // asks for one. Lives here rather than on IndexGraph because an IndexGraph is
+  // constructed per operation while the cache has to persist across queries.
+  std::unique_ptr<VectorCache> m_vector_cache;
+
 public:
+  // The vector cache for this index, creating it on first call when the cache
+  // mode asks for one, or nullptr when it does not. The mode is read HERE, per
+  // call, rather than captured at construction -- so moving it from a sysvar to
+  // a per-index setting later is a change to one function, not a restructure.
+  VectorCache *vector_cache();
+
+  // Drop cached state. Called when a write changes the index under the cache,
+  // and when the budget is reduced to nothing.
+  void invalidate_vector_cache(VID vid);
+  void clear_vector_cache();
+
   // Resolve the primary key for the level-0 node named by nid into out_parts
   // (one entry per key part), copied out. For an inlined key the single part
   // comes from the node field; for a spilled key it is unpacked from the PK
