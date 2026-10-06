@@ -57,6 +57,12 @@ inline long long vcache_misses = 0;
 inline long long vcache_evictions = 0;
 // A gauge, not a monotonic counter: bytes currently resident.
 inline long long vcache_resident_bytes = 0;
+// How the budget is being applied: how many times set_max_bytes() changed the
+// limit, and the slot count it last resolved to. A budget that never reaches
+// the cache leaves limit_changes at 0 while resident_bytes ignores it; a wrong
+// limit shows up as an implausible limit_slots.
+inline long long vcache_limit_changes = 0;
+inline long long vcache_limit_slots = 0;
 
 inline void stat_add(long long &counter, long long n) {
   __atomic_fetch_add(&counter, n, __ATOMIC_RELAXED);
