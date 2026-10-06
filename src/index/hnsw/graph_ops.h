@@ -97,9 +97,13 @@ public:
   // the candidate set with neighbours of the candidates. It defaults to
   // false, and we keep that default.
   //
-  // keepPrunedConnections retains pruned candidates to maintain a fixed
-  // number of connections per element. We disable it, allowing the heuristic
-  // to select the most diverse neighbours without retaining pruned candidates.
+  // keepPrunedConnections backfills from the discarded candidates so each
+  // element keeps a full set of connections. Enabled: with it off, a node
+  // whose candidates are mostly dominated keeps only the few survivors, and
+  // a dump of a 60k M=16 graph showed mean degree 9.0 against the cap of 16,
+  // 13% of nodes at degree <= 4. Under-connected nodes are dead ends during
+  // search, which has to be paid for with a wider frontier (higher
+  // ef_search). MariaDB's select_neighbors() backfills for the same reason.
   //
   // Keep these centralized as named constants rather than literals at each
   // call site, so there is a single place to change the policy if needed.
@@ -108,7 +112,7 @@ public:
   static constexpr ExtendCandidates SHOULD_EXTEND_CANDIDATES =
       ExtendCandidates::No;
   static constexpr KeepPrunedConnections SHOULD_KEEP_PRUNED_CONNECTIONS =
-      KeepPrunedConnections::No;
+      KeepPrunedConnections::Yes;
 
   GraphOperations(Graph &graph) : m_graph(graph) {};
 
