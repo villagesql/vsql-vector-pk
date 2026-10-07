@@ -1,0 +1,154 @@
+# Install vsql-svector extension
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+########################################################################
+#
+# Test binary ingest for SVECTOR.
+#
+# svector_from_string accepts, in addition to the '[...]' decimal form, a
+# binary payload: a 2-byte big-endian element count with its HIGH BIT SET,
+# followed by that many little-endian float32 elements.
+#
+#     [0x80 | dim_hi][dim_lo][f0 (4B LE)][f1]...[f(dim-1)]
+#
+# The high bit is what tells the forms apart. A decimal literal is ASCII, so
+# it always begins below 0x80 -- whether it starts with '[' or with whitespace
+# padding. A binary header always begins at or above 0x80. Nothing in the
+# element bytes, the padding, or the dimension's value can blur that.
+#
+# Hex literals below (X'..') are those encodings:
+#   dim 4, [1,2,3,4]        -> 8004 0000803F 00000040 00004040 00008040
+#   dim 4, [0.5,-0.5,0,1.5] -> 8004 0000003F 000000BF 00000000 0000C03F
+#
+########################################################################
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+
+--echo # Insert a vector via the binary form ...
+--echo # (_binary is required: a bare X'..' literal is coerced via the connection
+--echo #  charset and truncates at the first NUL byte; _binary delivers the raw
+--echo #  bytes intact to the SVECTOR converter.)
+INSERT INTO t VALUES (1, _binary X'80040000803F000000400000404000008040');
+
+--echo # ... and the SAME vector via the decimal-string path.
+INSERT INTO t VALUES (2, '[1.0, 2.0, 3.0, 4.0]');
+
+--echo # Both rows must be identical (binary ingest == string ingest).
+SELECT id, VECTOR_FORMAT(v, 1) AS formatted FROM t ORDER BY id;
+
+--echo # Distance between the two must be exactly 0.
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 1 AND b.id = 2;
+
+--echo # A second vector with fractional/negative values round-trips too.
+INSERT INTO t VALUES (3, _binary X'80040000003F000000BF000000000000C03F');
+INSERT INTO t VALUES (4, '[0.5, -0.5, 0.0, 1.5]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 3 AND b.id = 4;
+
+--echo #
+--echo # Element bytes never affect which form is chosen.
+--echo #
+
+--echo # First element is 0.0004149999876972288, whose little-endian bytes are
+--echo # 5B94D939 -- it begins with 0x5B, the code for '['.
+INSERT INTO t VALUES (5, _binary X'80045B94D939000000400000404000008040');
+INSERT INTO t VALUES (6, '[0.0004149999876972288, 2.0, 3.0, 4.0]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 5 AND b.id = 6;
+
+--echo # Last byte is 0x20, a space. It is a float byte and must be kept, not
+--echo # stripped as trailing padding: the 4th element is 1.0842021724855044e-19.
+INSERT INTO t VALUES (7, _binary X'80040000803F000000400000404000000020');
+INSERT INTO t VALUES (8, '[1.0, 2.0, 3.0, 1.0842021724855044e-19]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 7 AND b.id = 8;
+
+--echo #
+--echo # Whitespace padding belongs to the decimal form only.
+--echo #
+INSERT INTO t VALUES (9, '  [1.0, 2.0, 3.0, 4.0]  ');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 9 AND b.id = 2;
+
+--echo #
+--echo # Malformed binary payloads must be rejected.
+--echo #
+
+--echo # Declared dimension does not match the target column (3 vs SVECTOR(4)).
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (20, _binary X'80030000803F0000004000004040');
+
+--echo # Declared dimension 4, but only 3 elements of payload follow.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (21, _binary X'80040000803F0000004000004040');
+
+--echo # Declared dimension 4, but 5 elements of payload follow.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (22, _binary X'80040000803F0000004000004040000080400000A040');
+
+--echo # Payload length not a multiple of 4 after the header.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (23, _binary X'80040000803F00');
+
+--echo # Declared dimension of zero.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (24, _binary X'8000');
+
+--echo # Header alone, no elements.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (25, _binary X'8004');
+
+--echo # Shorter than the 2-byte header.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (26, _binary X'80');
+
+--echo # A decimal literal with no brackets is still a decimal error, not a
+--echo # binary one: its first byte is ASCII, below 0x80.
+--error ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+INSERT INTO t VALUES (27, '1.0, 2.0, 3.0, 4.0');
+
+DROP TABLE t;
+
+--echo #
+--echo # A dimension whose own bytes read as ASCII.
+--echo #
+--echo # 91 is 0x005B -- its low byte is 0x5B, the code for '['. Tagged it is
+--echo # 0x805B, and the leading 0x80 settles the form before either byte's
+--echo # ASCII meaning matters. (Identifying the form by content instead would
+--echo # have to guess here, and at dimensions 2304..3072 the HIGH byte is an
+--echo # ASCII whitespace code, so no amount of looking at the bytes suffices.)
+CREATE TABLE t_tag (
+  id INT PRIMARY KEY,
+  v  SVECTOR(91) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_tag VALUES (1, _binary X'805B0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F');
+SELECT id, VECTOR_DIMENSION(v) AS dim, L2_DISTANCE(v, v) AS self_dist
+FROM t_tag;
+DROP TABLE t_tag;
+
+--echo #
+--echo # The binary form also works as a function argument, which is how a
+--echo # client sends a query vector (SELECT ... ORDER BY L2_DISTANCE(v, ?)).
+--echo #
+CREATE TABLE t2 (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t2 VALUES (1, '[1.0, 2.0, 3.0, 4.0]');
+INSERT INTO t2 VALUES (2, '[0.5, -0.5, 0.0, 1.5]');
+
+--echo # Query vector as a binary payload; row 1 is an exact match (dist 0).
+SELECT id, L2_DISTANCE(v, _binary X'80040000803F000000400000404000008040') AS dist
+FROM t2 ORDER BY dist, id;
+
+DROP TABLE t2;
+
+--echo # binary ingest test completed
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
