@@ -304,6 +304,7 @@ bool LayerOperations<Graph, Policy>::evaluate_distances(
     std::vector<Candidate> &candidates, size_t begin) {
   // Distance computations are independent and could be parallelized
   // if Graph::distance() is thread-safe.
+  hnsw_count_distances(candidates.size() - begin);
   for (size_t i = begin; i < candidates.size(); ++i) {
     Candidate &candidate = candidates[i];
     bool failed = std::visit(
