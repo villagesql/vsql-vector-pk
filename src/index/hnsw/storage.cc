@@ -790,20 +790,30 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
 // function. Creating the cache lazily also means an index queried only in
 // CACHE_NONE mode never allocates one.
 VectorCache *IndexStore::vector_cache(uint32_t dim) {
+  // Serializes construction and replacement against other scans starting at
+  // the same time: without it two threads both construct and one result is
+  // leaked, or one frees a cache the other has just taken a pointer to. Held
+  // only here, at the start of a scan -- never during traversal, and never
+  // while a storage latch is held, so it sits outside the lock hierarchy in
+  // graph.h rather than under it.
+  //
+  // It does NOT make the cache safe to drop while a scan is running; see
+  // below.
+  std::lock_guard<std::mutex> guard(m_vector_cache_mutex);
   const long long mode = read_cache_mode();
   // Only CACHE_VECTORS is implemented; the sysvar refuses anything higher
   // (MAX_IMPLEMENTED_CACHE_MODE), so this is the whole mapping today. When the
   // pinned-skeleton modes land they branch here.
   assert(mode <= MAX_IMPLEMENTED_CACHE_MODE);
   if (mode < CACHE_VECTORS) {
-    // Mode turned off under a cache that already exists: drop it, so the
+    // Mode turned off under a cache that already exists: retire it, so the
     // memory is returned rather than held for a mode nobody is using.
-    m_vector_cache.reset();
+    retire_vector_cache();
     return nullptr;
   }
   const auto budget = static_cast<size_t>(read_max_cache_size());
   if (budget == 0) {
-    m_vector_cache.reset();
+    retire_vector_cache();
     return nullptr;
   }
   // A budget change cannot be applied to a live cache -- slots are sized and
@@ -811,11 +821,26 @@ VectorCache *IndexStore::vector_cache(uint32_t dim) {
   // is safe for the same reason the rest of the cache is: this runs at the
   // start of a scan, before any entry pointer has been handed out.
   if (m_vector_cache != nullptr && m_vector_cache->set_max_bytes(budget))
-    m_vector_cache.reset();
+    retire_vector_cache();
   if (m_vector_cache == nullptr)
     m_vector_cache = std::make_unique<VectorCache>(
         budget, dim, quant::qvector_padded_dim(dim));
   return m_vector_cache.get();
+}
+
+// A cache being replaced is not freed: a scan that started earlier still holds
+// a raw pointer to it, and to entries inside it. Nothing tracks those readers,
+// so the old cache is parked here and released only when the store itself is
+// destroyed.
+//
+// That is a deliberate leak, bounded by how often the budget or the mode
+// changes -- both operator actions, not workload events. The alternative is
+// refcounting every scan's use of the cache, which puts an atomic on the one
+// path this whole design exists to keep free of them. Revisit if a workload
+// ever flips these settings often enough for the retained caches to matter.
+void IndexStore::retire_vector_cache() {
+  if (m_vector_cache != nullptr)
+    m_retired_vector_caches.push_back(std::move(m_vector_cache));
 }
 
 void IndexStore::invalidate_vector_cache(VID vid) {

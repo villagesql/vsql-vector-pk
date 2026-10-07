@@ -64,7 +64,9 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
 
   const uint64_t buckets = round_up_pow2(
       static_cast<uint64_t>(static_cast<double>(m_capacity) / kMaxLoad) + 1);
-  m_index.assign(static_cast<size_t>(buckets), Bucket{});
+  // Bucket holds an atomic, so it is not copy-assignable: size the vector and
+  // let each element default-construct in place.
+  m_index = std::vector<Bucket>(static_cast<size_t>(buckets));
   m_index_mask = buckets - 1;
 }
 
@@ -72,7 +74,10 @@ VectorCache::Bucket *VectorCache::probe(uint64_t vid) {
   uint64_t i = mix(vid) & m_index_mask;
   for (;;) {
     Bucket &b = m_index[static_cast<size_t>(i)];
-    if (b.vid == vid) return &b;
+    // Acquire: pairs with the release in index_insert(). Seeing the key here
+    // guarantees the slot's bytes, written before that release, are visible.
+    const uint64_t cur = b.vid.load(std::memory_order_acquire);
+    if (cur == vid) return &b;
     // Only a never-used bucket ends the run. A tombstone is walked past and
     // NOT reclaimed: claiming one would place a key earlier in its run than
     // the empty bucket that bounds some other key's run, and that other key
@@ -80,27 +85,30 @@ VectorCache::Bucket *VectorCache::probe(uint64_t vid) {
     // cache is rebuilt, which is affordable because the resident set only
     // shrinks -- nothing re-fills a full cache, so probe runs cannot grow
     // without bound.
-    if (b.vid == 0) return &b;
+    if (cur == 0) return &b;
     i = (i + 1) & m_index_mask;
   }
 }
 
 void VectorCache::index_insert(uint64_t vid, uint32_t slot) {
   Bucket *b = probe(vid);
-  b->vid = vid;
   b->slot = slot;
+  // Release LAST: everything written before this -- the slot index here, and
+  // the entry's bytes in the caller -- is visible to any reader that acquires
+  // this vid.
+  b->vid.store(vid, std::memory_order_release);
 }
 
 void VectorCache::index_erase(uint64_t vid) {
   Bucket *b = probe(vid);
-  if (b->vid != vid) return;
+  if (b->vid.load(std::memory_order_relaxed) != vid) return;
   // Leave a tombstone rather than reinserting the run that follows: relocating
   // a bucket is cheap, but repairing requires rewriting buckets a concurrent
   // probe may be walking. kTombstone keeps the run intact for lookups while
   // marking the slot gone; probe() treats it as occupied-but-not-matching.
   // Tombstones lengthen probe runs as they accumulate, which only a rebuild
   // clears -- acceptable because nothing erases during query-only work.
-  b->vid = kTombstone;
+  b->vid.store(kTombstone, std::memory_order_release);
 }
 
 const quant::QData *VectorCache::get(VID vid) {
@@ -109,7 +117,7 @@ const quant::QData *VectorCache::get(VID vid) {
     return nullptr;
   }
   Bucket *b = probe(vid.value);
-  if (b->vid != vid.value) {
+  if (b->vid.load(std::memory_order_acquire) != vid.value) {
     stat_add(vcache_misses, 1);
     return nullptr;
   }
@@ -128,9 +136,15 @@ const quant::QData *VectorCache::insert(VID vid, const float *src) {
 
   // Only ever reached after get() missed, so the vid must not be resident --
   // a second fill would rewrite a slot a caller may be reading.
-  assert(probe(vid.value)->vid != vid.value);
+  assert(probe(vid.value)->vid.load(std::memory_order_relaxed) != vid.value);
 
-  if (m_used == m_limit) {
+  // Claim a slot. fetch_add is what makes ownership exclusive without a lock:
+  // whatever else is filling concurrently, no two threads get the same index.
+  // A claim past the limit is given back -- the cursor may briefly read above
+  // m_limit, which costs nothing because nothing is sized from it.
+  uint32_t slot = m_used.fetch_add(1, std::memory_order_relaxed);
+  if (slot >= m_limit) {
+    m_used.fetch_sub(1, std::memory_order_relaxed);
     // Full. Nothing is evicted to make room: a slot is written once and never
     // rewritten, which is what keeps a QData* valid for the cache's life.
     // Report the refusal and let the caller quantize into its OWN buffer --
@@ -140,40 +154,44 @@ const quant::QData *VectorCache::insert(VID vid, const float *src) {
     return nullptr;
   }
 
-  const uint32_t slot = m_used++;
   m_meta[slot].occupied = true;
   m_meta[slot].vid = vid.value;
-  ++m_live;
+  m_live.fetch_add(1, std::memory_order_relaxed);
   stat_add(vcache_resident_bytes, static_cast<long long>(m_entry_bytes));
-  index_insert(vid.value, slot);
 
+  // Fill the slot BEFORE publishing it. index_insert()'s release store is what
+  // makes these bytes visible to a reader that later finds the key.
   auto *q = slot_data(slot);
   quant::quantize(src, m_dim, m_padded_dim, q);
+  index_insert(vid.value, slot);
   return q;
 }
 
 void VectorCache::invalidate(VID vid) {
   if (m_capacity == 0) return;
   Bucket *b = probe(vid.value);
-  if (b->vid != vid.value) return;
+  if (b->vid.load(std::memory_order_acquire) != vid.value) return;
   const uint32_t slot = b->slot;
   index_erase(vid.value);
   // The slot is retired, not recycled: its bytes stay untouched because a
   // caller may still be reading them, and a later fill takes a fresh slot. So
   // the resident set only ever shrinks until the cache is rebuilt.
   m_meta[slot].occupied = false;
-  --m_live;
+  m_live.fetch_sub(1, std::memory_order_relaxed);
   stat_add(vcache_tombstones, 1);
   stat_add(vcache_resident_bytes, -static_cast<long long>(m_entry_bytes));
 }
 
 void VectorCache::clear() {
   stat_add(vcache_resident_bytes,
-           -static_cast<long long>(size_t{m_live} * m_entry_bytes));
-  m_live = 0;
-  m_used = 0;
+           -static_cast<long long>(size_t{m_live.load()} * m_entry_bytes));
+  m_live.store(0);
+  m_used.store(0);
   std::fill(m_meta.begin(), m_meta.end(), Meta{});
-  std::fill(m_index.begin(), m_index.end(), Bucket{});
+  for (Bucket &b : m_index) {
+    b.vid.store(0, std::memory_order_relaxed);
+    b.slot = 0;
+  }
 }
 
 bool VectorCache::set_max_bytes(size_t max_bytes) {

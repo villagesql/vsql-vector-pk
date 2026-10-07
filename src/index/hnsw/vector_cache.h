@@ -82,29 +82,44 @@
 // vector are unsupported -- its callers are VID-reuse guards on the write
 // path, so query-only work never tombstones anything.
 //
-// STILL NOT THREAD-SAFE, though fill-once removes most of what made it unsafe.
-// A slot is never rewritten and get() no longer writes at all, so a reader
-// holding a QData* is sound and concurrent readers of a FULL cache do not race.
-// What remains:
+// CONCURRENCY. Readers run lock-free and write nothing. Fill-once is what
+// makes that possible: a slot is written once, so there is no reclamation to
+// protect against and a reader's QData* can never be invalidated under it --
+// no pin, no epoch, no refcount on the read path.
 //
-//   1. Filling mutates. insert() claims a slot and an index bucket, so a
-//      reader probing while another thread fills can see a half-published
-//      bucket. Only while the cache is below capacity -- but that includes
-//      every query until it fills.
-//   2. invalidate() retires an entry a reader may be about to probe for.
-//      Rare, and on the write path, but unsynchronized.
-//   3. IndexStore::vector_cache() creates and drops the cache lazily; two
-//      threads racing there both construct and one leaks, and dropping it on
-//      cache_mode=0 frees the slab under anyone still reading -- reachable,
-//      since cache_mode is a global sysvar that takes effect on connections
-//      already running.
+// The protocol is two atomics:
 //
-// Closing those needs a guard on construction and on the fill path, not a pin
-// or an epoch on the read path. Until then this stays single-threaded.
+//   - m_used is the allocation cursor. One fetch_add claims a slot, which is
+//     what makes ownership exclusive without a lock. A claim past the limit is
+//     given back and the insert is refused.
+//   - Bucket::vid is the publication point. A filling thread writes the slot's
+//     bytes and its index first, then RELEASES vid; a reader ACQUIRES vid
+//     before trusting either. So a reader either does not see the key, and
+//     takes the miss path, or sees it and is guaranteed finished bytes.
+//
+// invalidate() releases a tombstone the same way: a concurrent reader sees the
+// key or does not, and both are correct answers. It is already serialized
+// against other writers by the Level Operation Lock (see graph.h).
+//
+// Construction and replacement are serialized by a mutex in
+// IndexStore::vector_cache(), taken once per scan -- never during traversal
+// and never under a storage latch, so it sits outside the lock hierarchy
+// rather than inside it.
+//
+// WHAT IS STILL NOT SAFE: nothing tracks which scans are using a cache, so a
+// cache that is replaced is retired rather than freed (see
+// retire_vector_cache()). A scan already in flight keeps using the old one,
+// which is correct but means a budget or mode change leaks one cache until the
+// store is destroyed. Bounded by operator actions, not by workload.
+//
+// The counters (hits, misses, resident bytes) are relaxed atomics, so they are
+// exact in aggregate but may be read mid-update. entries() is likewise a
+// snapshot. None of them is load-bearing for correctness.
 
 #ifndef VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -142,8 +157,10 @@ public:
 
   uint32_t dim() const { return m_dim; }
   uint32_t padded_dim() const { return m_padded_dim; }
-  size_t resident_bytes() const { return m_live * m_entry_bytes; }
-  size_t entries() const { return m_live; }
+  size_t resident_bytes() const {
+    return m_live.load(std::memory_order_relaxed) * m_entry_bytes;
+  }
+  size_t entries() const { return m_live.load(std::memory_order_relaxed); }
 
 private:
   // SLOT STORAGE. One slab, allocated once at capacity, entries at fixed
@@ -161,11 +178,13 @@ private:
   // but the cache holds fewer entries. Raising it again takes effect only up
   // to m_capacity.
   uint32_t m_limit = 0;
-  uint32_t m_live = 0;      // slots currently occupied
-  // Slots ever handed out. Only ever grows, and never past m_limit: a retired
-  // slot is not returned for reuse, so this is the admission cursor rather
-  // than a high-water mark.
-  uint32_t m_used = 0;
+  std::atomic<uint32_t> m_live{0};  // slots currently occupied
+  // Slots ever handed out, and the ALLOCATION CURSOR: a filling thread claims
+  // its slot with one fetch_add, which is what makes slot ownership exclusive
+  // without a lock. Only ever grows, and never past m_limit -- a retired slot
+  // is not returned for reuse, so this is a cursor rather than a high-water
+  // mark.
+  std::atomic<uint32_t> m_used{0};
 
   quant::QData *slot_data(uint32_t slot) {
     return reinterpret_cast<quant::QData *>(m_slab.data() +
@@ -197,8 +216,15 @@ private:
   // 0 == never used, kTombstone == retired. VID::INVALID is 0, so neither
   // sentinel can collide with a real key.
   static constexpr uint64_t kTombstone = ~uint64_t{0};
+  // `vid` is the PUBLICATION POINT for an entry. A filling thread writes the
+  // slot's bytes and its `slot` index first, then releases `vid` last; a
+  // reader acquires `vid` before touching either. So a reader that sees a key
+  // is guaranteed to see finished bytes behind it, and one that does not
+  // simply takes the miss path. Nothing else about a bucket ever changes
+  // after publication -- entries are written once -- so this one pair of
+  // atomics is the whole protocol.
   struct Bucket {
-    uint64_t vid = 0;
+    std::atomic<uint64_t> vid{0};
     uint32_t slot = 0;
   };
   std::vector<Bucket> m_index;

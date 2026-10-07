@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -604,6 +605,10 @@ private:
   // asks for one. Lives here rather than on IndexGraph because an IndexGraph is
   // constructed per operation while the cache has to persist across queries.
   std::unique_ptr<VectorCache> m_vector_cache;
+  // Caches replaced by a budget or mode change. See retire_vector_cache().
+  std::vector<std::unique_ptr<VectorCache>> m_retired_vector_caches;
+  // Guards construction and replacement of m_vector_cache only.
+  std::mutex m_vector_cache_mutex;
 
 public:
   // The vector cache for this index, creating it on first call when the cache
@@ -616,6 +621,7 @@ public:
 
   // Drop cached state. Called when a write changes the index under the cache,
   // and when the budget is reduced to nothing.
+  void retire_vector_cache();
   void invalidate_vector_cache(VID vid);
   void clear_vector_cache();
 
