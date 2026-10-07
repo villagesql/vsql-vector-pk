@@ -149,3 +149,20 @@ target_include_directories(storage_test PRIVATE
 target_compile_options(storage_test PRIVATE -UNDEBUG)
 
 add_test(NAME storage_test COMMAND storage_test)
+
+# Vector-cache test. Compiles the cache and the quantization kernel it stores
+# entries in; needs the SDK include dir for the Column/VID types the cache keys
+# on.
+add_executable(vector_cache_test
+    unittest/vector_cache_test.cc
+    src/index/hnsw/vector_cache.cc
+    src/quantize.cc
+)
+
+target_include_directories(vector_cache_test PRIVATE
+    ${VillageSQLExtensionFramework_INCLUDE_DIR}
+)
+
+target_compile_options(vector_cache_test PRIVATE -UNDEBUG)
+
+add_test(NAME vector_cache_test COMMAND vector_cache_test)

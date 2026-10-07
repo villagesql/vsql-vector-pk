@@ -70,18 +70,17 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
 
 VectorCache::Bucket *VectorCache::probe(uint64_t vid) {
   uint64_t i = mix(vid) & m_index_mask;
-  Bucket *first_free = nullptr;
   for (;;) {
     Bucket &b = m_index[static_cast<size_t>(i)];
     if (b.vid == vid) return &b;
-    // A tombstone does not end the run -- a key that collided past it is still
-    // further along -- but it is claimable, so remember the first one and hand
-    // it back if the key turns out to be absent.
-    if (b.vid == kTombstone) {
-      if (first_free == nullptr) first_free = &b;
-    } else if (b.vid == 0) {
-      return first_free != nullptr ? first_free : &b;
-    }
+    // Only a never-used bucket ends the run. A tombstone is walked past and
+    // NOT reclaimed: claiming one would place a key earlier in its run than
+    // the empty bucket that bounds some other key's run, and that other key
+    // would then be unreachable. Tombstones therefore accumulate until the
+    // cache is rebuilt, which is affordable because the resident set only
+    // shrinks -- nothing re-fills a full cache, so probe runs cannot grow
+    // without bound.
+    if (b.vid == 0) return &b;
     i = (i + 1) & m_index_mask;
   }
 }
