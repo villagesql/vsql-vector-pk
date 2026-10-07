@@ -28,7 +28,6 @@
 #include <cstdint>
 #include <queue>
 #include <type_traits>
-#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -73,16 +72,102 @@ private:
 // Default visited set: hash the node key. Used by any Graph that does not
 // supply its own -- IndexGraph, whose Nodes are values read out of storage
 // with no stable object to stamp.
+//
+// Open-addressed rather than a std::unordered_set, which a GCP profile of the
+// paged query path put at 14.1% of self time -- the largest non-kernel frame.
+// Chaining costs two dependent cache misses per probe (the bucket array, then
+// the node); this is one flat array of keys with linear probing, so the common
+// case is a single miss and collisions land on the same cache line.
+//
+// mark() is the only operation, so there are no erases and therefore no
+// tombstones: a key is written once and the table is only ever reset wholesale.
+// Occupancy is an explicit flag rather than a reserved key value, since a
+// Node's key type belongs to the Graph and need not leave a sentinel free.
+//
+// A key is an NID -- a Column::Ref {page, slot} encoding, not a sequence
+// number -- so the space is sparse and the low bits repeat across pages.
+// libstdc++'s std::hash<uint64_t> is the identity, which clusters badly on
+// exactly that shape, hence the mixing step.
 template <typename Node>
 class HashVisitedSet {
 public:
   // True if this call was the FIRST to see the node.
-  bool mark(const Node &node) { return m_seen.insert(node.key()).second; }
-  void clear() { m_seen.clear(); }
-  bool empty() const { return m_seen.empty(); }
+  bool mark(const Node &node) {
+    const uint64_t key = to_u64(node.key());
+    if ((m_count + 1) * 2 > m_slots.size()) grow();
+    uint64_t i = mix(key) & m_mask;
+    for (;;) {
+      Slot &slot = m_slots[static_cast<size_t>(i)];
+      if (!slot.used) {
+        slot.key = key;
+        slot.used = true;
+        ++m_count;
+        return true;
+      }
+      if (slot.key == key) return false;
+      i = (i + 1) & m_mask;
+    }
+  }
+
+  // Keeps the allocation. One LayerOperations is reused across levels and
+  // across whole inserts, so the table settles at the size of the largest
+  // search it has served and stops reallocating.
+  void clear() {
+    if (m_count == 0) return;
+    std::fill(m_slots.begin(), m_slots.end(), Slot{});
+    m_count = 0;
+  }
+
+  bool empty() const { return m_count == 0; }
 
 private:
-  std::unordered_set<typename Node::KeyType> m_seen;
+  // An explicit occupancy flag rather than a reserved key value: a Node's key
+  // type is the Graph's business, and nothing guarantees it leaves a sentinel
+  // free -- a graph whose first node is id 0 would otherwise lose it.
+  struct Slot {
+    uint64_t key = 0;
+    bool used = false;
+  };
+
+  static constexpr size_t kInitialSlots = 256;
+
+  // A key is an Id<> wrapper in the real graph and a plain integer in the
+  // tests, so take whichever this Node offers.
+  template <typename K>
+  static auto to_u64(const K &k) -> decltype(static_cast<uint64_t>(k.value)) {
+    return static_cast<uint64_t>(k.value);
+  }
+  static uint64_t to_u64(uint64_t k) { return k; }
+
+  // splitmix64 finalizer: spreads the low-entropy slot bits of a Column::Ref
+  // across the whole word.
+  static uint64_t mix(uint64_t x) {
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+  }
+
+  // Kept at <= 50% load so probe runs stay short.
+  void grow() {
+    const size_t next = m_slots.empty() ? kInitialSlots : m_slots.size() * 2;
+    std::vector<Slot> moved(next);
+    const uint64_t mask = next - 1;
+    for (const Slot &slot : m_slots) {
+      if (!slot.used) continue;
+      uint64_t i = mix(slot.key) & mask;
+      while (moved[static_cast<size_t>(i)].used) i = (i + 1) & mask;
+      moved[static_cast<size_t>(i)] = slot;
+    }
+    m_slots.swap(moved);
+    m_mask = mask;
+  }
+
+  std::vector<Slot> m_slots;
+  uint64_t m_mask = 0;
+  size_t m_count = 0;
 };
 
 // Picks Graph::VisitedSet when the Graph defines one, else HashVisitedSet.
