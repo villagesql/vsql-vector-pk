@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <queue>
+#include <type_traits>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -67,6 +68,33 @@ public:
 
 private:
   using std::priority_queue<Args...>::c;
+};
+
+// Default visited set: hash the node key. Used by any Graph that does not
+// supply its own -- IndexGraph, whose Nodes are values read out of storage
+// with no stable object to stamp.
+template <typename Node>
+class HashVisitedSet {
+public:
+  // True if this call was the FIRST to see the node.
+  bool mark(const Node &node) { return m_seen.insert(node.key()).second; }
+  void clear() { m_seen.clear(); }
+  bool empty() const { return m_seen.empty(); }
+
+private:
+  std::unordered_set<typename Node::KeyType> m_seen;
+};
+
+// Picks Graph::VisitedSet when the Graph defines one, else HashVisitedSet.
+// A Graph whose nodes are stable objects (ResidentGraph) can then stamp a
+// generation counter on the node instead of hashing.
+template <typename Graph, typename Node, typename = void>
+struct VisitedSetFor {
+  using type = HashVisitedSet<Node>;
+};
+template <typename Graph, typename Node>
+struct VisitedSetFor<Graph, Node, std::void_t<typename Graph::VisitedSet>> {
+  using type = typename Graph::VisitedSet;
 };
 
 } // namespace detail
@@ -239,6 +267,16 @@ private:
   // untouched. Returns true if a graph operation fails.
   bool evaluate_distances(std::vector<Candidate> &candidates, size_t begin = 0);
 
+  // The body of evaluate_distances() once the query variant has been resolved
+  // to a concrete alternative, so the per-candidate loop calls
+  // Graph::distance() directly instead of dispatching through std::visit.
+  // Query is either Node (insert: the node being linked) or NodeData (select:
+  // the query vector).
+  template <typename Query>
+  bool evaluate_distances_with(const Query &query,
+                               std::vector<Candidate> &candidates,
+                               size_t begin);
+
   // Seeds m_visited, m_candidates and m_results from the entry points
   // (Algorithm 2, lines 1-3). Returns true if a graph operation fails.
   // The public search() and seed() both wrap this, after their own reset().
@@ -273,7 +311,13 @@ private:
   // descent through the graph).
   LevelId m_level{};
 
-  std::unordered_set<typename Node::KeyType> m_visited;
+  // Visited set for the current search. Graph may supply its own type via a
+  // nested `VisitedSet`; otherwise this falls back to hashing node keys.
+  // ResidentGraph uses the generation-stamp form, which replaces a hash insert
+  // per neighbour with a compare-and-store against a field already in the
+  // node's cache line -- a profile of its query path put the hash insert at
+  // ~6.5% of self time.
+  typename detail::VisitedSetFor<Graph, Node>::type m_visited;
   MinQueue m_candidates;
   MaxQueue m_results;
 
