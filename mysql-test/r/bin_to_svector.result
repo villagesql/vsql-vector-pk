@@ -1,0 +1,125 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+# Insert a vector via the binary form ...
+# (_binary is required: a bare X'..' literal is coerced via the connection
+#  charset and truncates at the first NUL byte; _binary delivers the raw
+#  bytes intact to the SVECTOR converter.)
+INSERT INTO t VALUES (1, _binary X'80040000803F000000400000404000008040');
+# ... and the SAME vector via the decimal-string path.
+INSERT INTO t VALUES (2, '[1.0, 2.0, 3.0, 4.0]');
+# Both rows must be identical (binary ingest == string ingest).
+SELECT id, VECTOR_FORMAT(v, 1) AS formatted FROM t ORDER BY id;
+id	formatted
+1	[1,2,3,4]
+2	[1,2,3,4]
+# Distance between the two must be exactly 0.
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 1 AND b.id = 2;
+dist
+0
+# A second vector with fractional/negative values round-trips too.
+INSERT INTO t VALUES (3, _binary X'80040000003F000000BF000000000000C03F');
+INSERT INTO t VALUES (4, '[0.5, -0.5, 0.0, 1.5]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 3 AND b.id = 4;
+dist
+0
+#
+# Element bytes never affect which form is chosen.
+#
+# First element is 0.0004149999876972288, whose little-endian bytes are
+# 5B94D939 -- it begins with 0x5B, the code for '['.
+INSERT INTO t VALUES (5, _binary X'80045B94D939000000400000404000008040');
+INSERT INTO t VALUES (6, '[0.0004149999876972288, 2.0, 3.0, 4.0]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 5 AND b.id = 6;
+dist
+0
+# Last byte is 0x20, a space. It is a float byte and must be kept, not
+# stripped as trailing padding: the 4th element is 1.0842021724855044e-19.
+INSERT INTO t VALUES (7, _binary X'80040000803F000000400000404000000020');
+INSERT INTO t VALUES (8, '[1.0, 2.0, 3.0, 1.0842021724855044e-19]');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 7 AND b.id = 8;
+dist
+0
+#
+# Whitespace padding belongs to the decimal form only.
+#
+INSERT INTO t VALUES (9, '  [1.0, 2.0, 3.0, 4.0]  ');
+SELECT L2_DISTANCE(a.v, b.v) AS dist
+FROM t a, t b WHERE a.id = 9 AND b.id = 2;
+dist
+0
+#
+# Malformed binary payloads must be rejected.
+#
+# Declared dimension does not match the target column (3 vs SVECTOR(4)).
+INSERT INTO t VALUES (20, _binary X'80030000803F0000004000004040');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x03\x00\x00\x80?\x00\x00\x00@\x00\x00@@' for column 'v' at row 1
+# Declared dimension 4, but only 3 elements of payload follow.
+INSERT INTO t VALUES (21, _binary X'80040000803F0000004000004040');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x04\x00\x00\x80?\x00\x00\x00@\x00\x00@@' for column 'v' at row 1
+# Declared dimension 4, but 5 elements of payload follow.
+INSERT INTO t VALUES (22, _binary X'80040000803F0000004000004040000080400000A040');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x04\x00\x00\x80?\x00\x00\x00@\x00\x00@@\x00\x00\x80@\x00\x00\xA0@' for column 'v' at row 1
+# Payload length not a multiple of 4 after the header.
+INSERT INTO t VALUES (23, _binary X'80040000803F00');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x04\x00\x00\x80?\x00' for column 'v' at row 1
+# Declared dimension of zero.
+INSERT INTO t VALUES (24, _binary X'8000');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x00' for column 'v' at row 1
+# Header alone, no elements.
+INSERT INTO t VALUES (25, _binary X'8004');
+ERROR HY000: Incorrect SVECTOR value: '\x80\x04' for column 'v' at row 1
+# Shorter than the 2-byte header.
+INSERT INTO t VALUES (26, _binary X'80');
+ERROR HY000: Incorrect SVECTOR value: '\x80' for column 'v' at row 1
+# A decimal literal with no brackets is still a decimal error, not a
+# binary one: its first byte is ASCII, below 0x80.
+INSERT INTO t VALUES (27, '1.0, 2.0, 3.0, 4.0');
+ERROR HY000: Incorrect SVECTOR value: '1.0, 2.0, 3.0, 4.0' for column 'v' at row 1
+DROP TABLE t;
+#
+# A dimension whose own bytes read as ASCII.
+#
+# 91 is 0x005B -- its low byte is 0x5B, the code for '['. Tagged it is
+# 0x805B, and the leading 0x80 settles the form before either byte's
+# ASCII meaning matters. (Identifying the form by content instead would
+# have to guess here, and at dimensions 2304..3072 the HIGH byte is an
+# ASCII whitespace code, so no amount of looking at the bytes suffices.)
+CREATE TABLE t_tag (
+id INT PRIMARY KEY,
+v  SVECTOR(91) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t_tag VALUES (1, _binary X'805B0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F0000803F');
+SELECT id, VECTOR_DIMENSION(v) AS dim, L2_DISTANCE(v, v) AS self_dist
+FROM t_tag;
+id	dim	self_dist
+1	91	0
+DROP TABLE t_tag;
+#
+# The binary form also works as a function argument, which is how a
+# client sends a query vector (SELECT ... ORDER BY L2_DISTANCE(v, ?)).
+#
+CREATE TABLE t2 (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t2 VALUES (1, '[1.0, 2.0, 3.0, 4.0]');
+INSERT INTO t2 VALUES (2, '[0.5, -0.5, 0.0, 1.5]');
+# Query vector as a binary payload; row 1 is an exact match (dist 0).
+SELECT id, L2_DISTANCE(v, _binary X'80040000803F000000400000404000008040') AS dist
+FROM t2 ORDER BY dist, id;
+id	dist
+1	0
+2	4.663689526544408
+DROP TABLE t2;
+# binary ingest test completed
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
