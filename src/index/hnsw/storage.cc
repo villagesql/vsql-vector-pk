@@ -1068,13 +1068,24 @@ bool position(Index::Cursor cursor, Index::CursorOp op, bool *eof,
   return false;
 }
 
-bool fetch(Index::Cursor cursor, Column::Ref *col_refs,
+bool fetch(Index::Cursor cursor, IndexScanKey::KeyPartRef *key_ref,
+           Column::Ref *col_refs,
            IndexScanKey::KeyPartData * /*key_columns*/,
-           IndexScanKey::KeyPartData *pkey_columns, char *err,
-           uint32_t err_len) {
+           IndexScanKey::KeyPartData *pkey_columns, Segment::TrxRef *trx_ref,
+           bool *delete_mark, char *err, uint32_t err_len) {
   auto *c = static_cast<Cursor *>(cursor);
   const Node *node = c->current();
   assert(node != nullptr);
+
+  // The index declares HAS_ROW_REF, so the server resolves the row from
+  // pkey_columns below and does not look the entry up by key_ref.
+  *key_ref = static_cast<IndexScanKey::KeyPartRef>(node->nid.value);
+
+  // Entries carry no writing transaction or delete mark. Plain reads check
+  // visibility on the clustered row; READ COMMITTED locking reads keep a hit
+  // only if the row's DB_TRX_ID equals trx_ref, so they return no rows.
+  *trx_ref = 0;
+  *delete_mark = false;
 
   // vid is the vector's own stable column reference.
   col_refs[VECTOR_KEY_POS] = static_cast<Column::Ref>(node->vid.value);
