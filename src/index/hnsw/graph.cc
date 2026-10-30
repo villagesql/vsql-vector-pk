@@ -96,7 +96,8 @@ IndexGraph::IndexGraph(IndexStore &store, const Index &index,
     : m_store(store), m_index(index), m_trx_ref(trx_ref),
       m_ctx(make_graph_context(store, vector_buf_size, err)),
       m_dist(fetch_distance_helper_name().data(), vector_buf_size,
-             IndexStore::KEY_REF_SIZE) {}
+             IndexStore::KEY_REF_SIZE),
+      m_vectors(vector_buf_size) {}
 
 bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
   assert(vid.is_valid());
@@ -120,20 +121,29 @@ bool IndexGraph::distance(const NodeData &a, const NodeData &b,
   return m_dist.eval(a.data, b.data, out, m_ctx.m_error);
 }
 
-bool IndexGraph::distance(const Node &a, const Node &b, DistanceType &out) {
-  NodeData a_data;
-  NodeData b_data;
-  if (resolve_node_data(a.vid, m_ctx.m_vector_buf_1, a_data) ||
-      resolve_node_data(b.vid, m_ctx.m_vector_buf_2, b_data))
-    return true;
+bool IndexGraph::decoded_vector(const Node &node, const native::Data *&out) {
+  out = m_vectors.find(node.vid);
+  if (out != nullptr)
+    return false;
 
-  // a_data here is resolved into a REUSED buffer (m_vector_buf_1): its source
-  // pointer repeats across calls with different contents, so it must never hit
-  // the evaluator's decoded-a reuse cache (which keys on that pointer).
-  // Invalidate it; only the fixed-NodeData-query overload may benefit from the
-  // cache.
-  m_dist.invalidate_fixed_operand();
-  return distance(a_data, b_data, out);
+  NodeData data;
+  if (resolve_node_data(node.vid, m_ctx.m_vector_buf_1, data))
+    return true;
+  const native::Data *decoded = nullptr;
+  if (m_dist.decode(data.data, m_vectors.reserve(), m_vectors.entry_size(),
+                    &decoded, m_ctx.m_error))
+    return true;
+  out = m_vectors.commit(node.vid);
+  return false;
+}
+
+bool IndexGraph::distance(const Node &a, const Node &b, DistanceType &out) {
+  // Both pointers stay valid together: entries in m_vectors never move.
+  const native::Data *a_vec = nullptr;
+  const native::Data *b_vec = nullptr;
+  if (decoded_vector(a, a_vec) || decoded_vector(b, b_vec))
+    return true;
+  return m_dist.eval(a_vec, b_vec, out, m_ctx.m_error);
 }
 
 bool IndexGraph::distance(const NodeData &a, const Node &b, DistanceType &out) {
@@ -146,17 +156,6 @@ bool IndexGraph::distance(const NodeData &a, const Node &b, DistanceType &out) {
     return true;
 
   return distance(a, b_data, out);
-}
-
-bool IndexGraph::resolve_fixed_operand(const Node &node, NodeData &out) {
-  if (resolve_node_data(node.vid, m_ctx.m_vector_buf_1, out)) return true;
-  // out.data.data now points at m_vector_buf_1, whose address repeats across
-  // calls with different content -- the evaluator's decoded-a reuse cache keys
-  // on that pointer, so it must be invalidated here. The first distance(out, .)
-  // then decodes it once (cache miss) and subsequent calls in the caller's loop
-  // reuse it.
-  m_dist.invalidate_fixed_operand();
-  return false;
 }
 
 bool IndexGraph::neighbours(const Node &node, LevelId level,

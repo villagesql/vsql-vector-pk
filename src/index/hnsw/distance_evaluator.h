@@ -46,9 +46,9 @@ namespace svector::hnsw {
 // fixed across every candidate. eval() therefore decodes operand `a` only when
 // its source pointer differs from the last call, and always decodes `b`. The
 // key is the raw source pointer: identical pointer => identical already-decoded
-// bytes. Callers that feed `a` from a buffer whose address is reused with
-// DIFFERENT contents across calls must call invalidate_fixed_operand() first,
-// or a stale pointer-match would reuse the wrong decode.
+// bytes. So `a` must never come from a buffer whose address is reused with
+// DIFFERENT contents across calls, or a stale pointer-match would reuse the
+// wrong decode.
 class DistanceEvaluator {
 public:
   using NativeDistFn = native::DistFn;
@@ -70,11 +70,6 @@ public:
   }
 
   bool valid() const { return m_fn != nullptr; }
-
-  // Invalidate the fixed-operand (a) decode cache. Call before an eval() whose
-  // `a` comes from a reused buffer that now holds different bytes at the same
-  // address.
-  void invalidate_fixed_operand() { m_decoded_a_src = nullptr; }
 
   // Decode a and b (a reused per the model above), compute the distance, write
   // it to out. Returns true on error (writes err). err is a non-owning buffer.
@@ -103,8 +98,23 @@ public:
     return false;
   }
 
-private:
-  bool decode(const Column::Data &v, ScratchBytes &buf,
+  // Computes the distance between two operands the caller has already
+  // decoded, e.g. held in a DecodedVectorCache. Returns true on error.
+  bool eval(const native::Data *a, const native::Data *b, double &out,
+            std::span<char> err) {
+    if (m_fn == nullptr) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: unresolved distance function (helper '%s')",
+               m_helper_name);
+      return true;
+    }
+    out = m_fn(a, b);
+    return false;
+  }
+
+  // Decodes the raw stored value v into buf, which must be buf_len bytes
+  // aligned for native::Data, and points *dp at it. Returns true on error.
+  bool decode(const Column::Data &v, void *buf, size_t buf_len,
               const native::Data **dp, std::span<char> err) {
     if (v.length < m_prefix) {
       snprintf(err.data(), err.size(), "HNSW: distance: value too short (len=%u)",
@@ -118,13 +128,19 @@ private:
     // persisted SVECTOR format ([ref][floats]) has no single owner; consolidate
     // all these sites into one format helper (e.g. svector_format.h) instead of
     // adding yet another copy.
-    if (native::from_encoded(v.data + m_prefix, v.length - m_prefix, buf.data(),
-                             buf.size())) {
+    if (native::from_encoded(v.data + m_prefix, v.length - m_prefix, buf,
+                             buf_len)) {
       snprintf(err.data(), err.size(), "HNSW: distance: failed to decode vector");
       return true;
     }
-    *dp = reinterpret_cast<const native::Data *>(buf.data());
+    *dp = static_cast<const native::Data *>(buf);
     return false;
+  }
+
+private:
+  bool decode(const Column::Data &v, ScratchBytes &buf, const native::Data **dp,
+              std::span<char> err) {
+    return decode(v, buf.data(), buf.size(), dp, err);
   }
 
   NativeDistFn m_fn;
