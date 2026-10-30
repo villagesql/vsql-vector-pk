@@ -24,6 +24,7 @@
 #ifndef VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_GRAPH_H
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_GRAPH_H
 
+#include "decoded_vector_cache.h"
 #include "distance_evaluator.h"
 #include "hnsw.h"
 #include "storage.h"
@@ -292,19 +293,13 @@ public:
   IndexGraph(IndexStore &store, const Index &index, Segment::TrxRef trx_ref,
              size_t vector_buf_size, std::span<char> err);
 
+  // Distance between two graph nodes. Each node's vector is fetched and
+  // decoded once per IndexGraph and kept in m_vectors, so comparing the same
+  // nodes again (as the Algorithm-4 heuristic and the neighbour reselection
+  // after an overflowing link do throughout an insert) costs only the kernel.
   bool distance(const Node &a, const Node &b, DistanceType &out);
 
   bool distance(const NodeData &a, const Node &b, DistanceType &out);
-
-  // Resolve a graph node's stored vector into NodeData held in a dedicated
-  // buffer (m_vector_buf_1) that is NOT touched by the distance() overloads
-  // (they use m_vector_buf_2 for their varying operand). This lets a caller
-  // that compares one fixed node against many others -- e.g. the Algorithm-4
-  // dominance check -- resolve the fixed operand once, then call
-  // distance(NodeData, Node) in the loop so the fixed operand's decode is
-  // reused across the varying ones instead of re-resolved and re-decoded each
-  // comparison. Returns true on error.
-  bool resolve_fixed_operand(const Node &node, NodeData &out);
 
   // level is node's own level. Callers always already know it (it's how
   // they located node in the first place), so it's taken directly instead
@@ -478,10 +473,13 @@ private:
 
   // Resolves a node's vid -- which is the server's stable column reference for
   // the vector the node indexes -- back to that vector's data, which the server
-  // fills into buf. Each operand of a distance() call gets its own buffer
-  // (m_vector_buf_1/m_vector_buf_2), so the first stays valid while the second
-  // is resolved.
+  // fills into buf. decoded_vector() resolves into m_vector_buf_1 and
+  // distance(NodeData, Node) into m_vector_buf_2.
   bool resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out);
+
+  // Points out at node's decoded vector in m_vectors, fetching and decoding it
+  // first if this IndexGraph has not yet. Returns true on error.
+  bool decoded_vector(const Node &node, const native::Data *&out);
 
   // One link in a node's overflow chain: the overflow entry to drop (nid),
   // and the record whose Overflow field currently points to it (prev, of
@@ -609,6 +607,9 @@ private:
   // distance(). Constructed once from resolve_distance_fn(); see
   // distance_evaluator.h.
   DistanceEvaluator m_dist;
+  // Decoded vectors of the graph nodes this call has compared; see
+  // distance(const Node &, const Node &).
+  DecodedVectorCache m_vectors;
 };
 
 } // namespace svector::hnsw
