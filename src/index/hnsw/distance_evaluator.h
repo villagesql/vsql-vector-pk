@@ -28,6 +28,7 @@
 #include "../../native_vector.h"
 #include "hnsw.h"
 
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -37,18 +38,22 @@ namespace svector::hnsw {
 
 // Computes the graph distance between two raw stored vector values using a
 // native kernel, owning everything that requires: the resolved kernel pointer
-// and the scratch buffers the raw [storage-ref prefix][floats] operands are
-// decoded into. Pulling this out of IndexGraph keeps that class about graph
-// structure and gives the "decode-and-compute" hot path -- including its
-// fixed-operand decode reuse -- one home.
+// and the scratch buffers for operands that cannot be read in place. Pulling
+// this out of IndexGraph keeps that class about graph structure and gives the
+// "read-and-compute" hot path -- including its fixed-operand reuse -- one home.
+//
+// A stored value is [storage-ref prefix][little-endian float32 x dim]. On a
+// little-endian host those bytes already are the floats, so the kernel reads
+// them in place when they are aligned for float; otherwise (a big-endian host,
+// or a misaligned source) they are decoded into a scratch buffer first.
 //
 // Reuse model: in a layer traversal one operand (the query/insert vector) is
-// fixed across every candidate. eval() therefore decodes operand `a` only when
-// its source pointer differs from the last call, and always decodes `b`. The
-// key is the raw source pointer: identical pointer => identical already-decoded
-// bytes. So `a` must never come from a buffer whose address is reused with
-// DIFFERENT contents across calls, or a stale pointer-match would reuse the
-// wrong decode.
+// fixed across every candidate. eval() therefore resolves operand `a` only when
+// its source pointer differs from the last call, and always resolves `b`. The
+// key is the raw source pointer: identical pointer => identical bytes. So `a`
+// must never come from a buffer whose address is reused with DIFFERENT
+// contents across calls, or a stale pointer-match would reuse the wrong
+// vector.
 class DistanceEvaluator {
 public:
   using NativeDistFn = native::DistFn;
@@ -57,12 +62,12 @@ public:
   // reads it from the server and passes it in); the evaluator maps it to a
   // native kernel via distance_registry.h. An unknown name leaves the evaluator
   // unresolved -- eval() then reports it, naming the offending helper. buf_size
-  // is the raw maximum value length; the two decode buffers are sized to it (>=
-  // the decoded native length). prefix is the storage-ref header stripped off
-  // each value before decoding the floats.
+  // is the raw maximum value length; the two scratch buffers are sized to it
+  // (>= the decoded float length). prefix is the storage-ref header stripped
+  // off each value before its floats.
   DistanceEvaluator(const char *helper_name, size_t buf_size, uint32_t prefix)
       : m_fn(native::dist_for_name(helper_name)), m_prefix(prefix),
-        m_decoded_a(buf_size), m_decoded_b(buf_size) {
+        m_scratch_a(buf_size), m_scratch_b(buf_size) {
     if (m_fn == nullptr && helper_name != nullptr) {
       // Keep the name for eval()'s error; the buffer is small and fixed.
       std::strncpy(m_helper_name, helper_name, sizeof(m_helper_name) - 1);
@@ -71,30 +76,35 @@ public:
 
   bool valid() const { return m_fn != nullptr; }
 
-  // Decode a and b (a reused per the model above), compute the distance, write
-  // it to out. Returns true on error (writes err). err is a non-owning buffer.
-  // out is double -- IndexGraph::DistanceType -- taken concretely here to avoid
-  // a circular include of graph.h for what is a fixed type.
+  // Resolve a and b to their floats (a reused per the model above), compute
+  // the distance, write it to out. Returns true on error (writes err). err is a
+  // non-owning buffer. out is double -- IndexGraph::DistanceType -- taken
+  // concretely here to avoid a circular include of graph.h for what is a fixed
+  // type.
   bool eval(const Column::Data &a, const Column::Data &b, double &out,
             std::span<char> err) {
     if (m_fn == nullptr) {
+      return unresolved(err);
+    }
+    // Operand a is fixed across a traversal's candidates, so reuse it when the
+    // source pointer is unchanged; b always varies.
+    if (a.data != m_a_src) {
+      if (floats(a, m_scratch_a, m_a_floats, m_a_dim, err)) {
+        m_a_src = nullptr;
+        return true;
+      }
+      m_a_src = a.data;
+    }
+    const float *b_floats = nullptr;
+    uint32_t b_dim = 0;
+    if (floats(b, m_scratch_b, b_floats, b_dim, err))
+      return true;
+    if (b_dim != m_a_dim) {
       snprintf(err.data(), err.size(),
-               "HNSW: distance: unresolved distance function (helper '%s')",
-               m_helper_name);
+               "HNSW: distance: dimension mismatch (%u vs %u)", m_a_dim, b_dim);
       return true;
     }
-    const native::Data *a_data = nullptr;
-    const native::Data *b_data = nullptr;
-    // Operand a is fixed across a traversal's candidates, so reuse its decode
-    // when the source pointer is unchanged; b always varies.
-    if (a.data == m_decoded_a_src) {
-      a_data = reinterpret_cast<const native::Data *>(m_decoded_a.data());
-    } else {
-      if (decode(a, m_decoded_a, &a_data, err)) return true;
-      m_decoded_a_src = a.data;
-    }
-    if (decode(b, m_decoded_b, &b_data, err)) return true;
-    out = m_fn(a_data, b_data);
+    out = m_fn(m_a_floats, b_floats, m_a_dim);
     return false;
   }
 
@@ -103,12 +113,9 @@ public:
   bool eval(const native::Data *a, const native::Data *b, double &out,
             std::span<char> err) {
     if (m_fn == nullptr) {
-      snprintf(err.data(), err.size(),
-               "HNSW: distance: unresolved distance function (helper '%s')",
-               m_helper_name);
-      return true;
+      return unresolved(err);
     }
-    out = m_fn(a, b);
+    out = m_fn(a->data, b->data, a->dim);
     return false;
   }
 
@@ -138,20 +145,56 @@ public:
   }
 
 private:
-  bool decode(const Column::Data &v, ScratchBytes &buf, const native::Data **dp,
-              std::span<char> err) {
-    return decode(v, buf.data(), buf.size(), dp, err);
+  bool unresolved(std::span<char> err) const {
+    snprintf(err.data(), err.size(),
+             "HNSW: distance: unresolved distance function (helper '%s')",
+             m_helper_name);
+    return true;
+  }
+
+  // Points out at the dim floats of the raw stored value v: in place when the
+  // host is little-endian and they are aligned for float, else decoded into
+  // buf. Returns true on error.
+  bool floats(const Column::Data &v, ScratchBytes &buf, const float *&out,
+              uint32_t &dim, std::span<char> err) {
+    if (v.length < m_prefix || (v.length - m_prefix) % sizeof(float) != 0 ||
+        v.length - m_prefix > buf.size()) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: bad vector length (len=%u)", v.length);
+      return true;
+    }
+    dim = (v.length - m_prefix) / sizeof(float);
+    if (dim == 0 || dim > native::MAX_VECTOR_DIMENSION) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: bad vector dimension (%u)", dim);
+      return true;
+    }
+    const unsigned char *src = v.data + m_prefix;
+    if constexpr (std::endian::native == std::endian::little) {
+      if (native::is_aligned(src, alignof(float))) {
+        out = reinterpret_cast<const float *>(src);
+        return false;
+      }
+    }
+    auto *dst = reinterpret_cast<float *>(buf.data());
+    for (uint32_t i = 0; i < dim; i++) {
+      dst[i] = native::float4get(src + i * sizeof(float));
+    }
+    out = dst;
+    return false;
   }
 
   NativeDistFn m_fn;
   uint32_t m_prefix;
-  // Decoded native::Data for each operand. Two buffers so both are live at once
-  // for the kernel call.
-  ScratchBytes m_decoded_a;
-  ScratchBytes m_decoded_b;
-  // Source pointer last decoded into m_decoded_a; nullptr means nothing
-  // reusable is held. See the reuse model above.
-  const unsigned char *m_decoded_a_src = nullptr;
+  // Scratch for each operand when it cannot be read in place. Two buffers so
+  // both are live at once for the kernel call.
+  ScratchBytes m_scratch_a;
+  ScratchBytes m_scratch_b;
+  // Source pointer last resolved for operand a, and its floats; nullptr means
+  // nothing reusable is held. See the reuse model above.
+  const unsigned char *m_a_src = nullptr;
+  const float *m_a_floats = nullptr;
+  uint32_t m_a_dim = 0;
   // The bound helper name, kept only when it did not resolve, for eval()'s
   // error message. Same 64-byte cap the server name lookup uses.
   char m_helper_name[64] = {};
