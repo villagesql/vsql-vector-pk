@@ -41,7 +41,9 @@
 // pure math and the name policy has one obvious home.
 namespace svector::native {
 
-using DistFn = double (*)(const Data *, const Data *);
+// The kernels over dim floats at each operand (the native_vector.h form that
+// can read stored bytes in place).
+using DistFn = double (*)(const float *, const float *, uint32_t);
 
 inline constexpr const char kDistL1[] = "l1_distance";
 inline constexpr const char kDistL2Squared[] = "l2_squared_distance";

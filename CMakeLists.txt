@@ -130,6 +130,20 @@ target_compile_options(graph_ops_test PRIVATE -UNDEBUG)
 
 add_test(NAME graph_ops_test COMMAND graph_ops_test)
 
+# DistanceEvaluator test. Header-only like the graph/layer tests, but the
+# evaluator takes Column::Data from the SDK, so it needs the SDK include dir.
+add_executable(distance_evaluator_test
+    unittest/distance_evaluator_test.cc
+)
+
+target_include_directories(distance_evaluator_test PRIVATE
+    ${VillageSQLExtensionFramework_INCLUDE_DIR}
+)
+
+target_compile_options(distance_evaluator_test PRIVATE -UNDEBUG)
+
+add_test(NAME distance_evaluator_test COMMAND distance_evaluator_test)
+
 # Storage-layer test. Unlike the header-only graph/layer tests, it drives the
 # real column-storage sources against an in-memory fake storage backend, so it
 # compiles those sources and needs the SDK include dir (storage_api.h).

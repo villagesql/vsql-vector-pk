@@ -210,21 +210,28 @@ bool to_encoded(const void *native_data, unsigned char *encoded_buffer,
 // produces a well-ordered +inf (the reassociation flags do NOT assume finite
 // math), so L2/inner-product ranking stays correct on pathological inputs.
 
+// Each kernel has two forms: one over dim floats at a and b, which can point
+// straight into stored bytes (see DistanceEvaluator), and one over native Data
+// that forwards to it.
+
 // L1 distance (Manhattan distance) between two vectors
-static V_FUNC_ALWAYS_INLINE double dist_l1(const Data *v1, const Data *v2) {
+static V_FUNC_ALWAYS_INLINE double dist_l1(const float *a, const float *b,
+                                           uint32_t dim) {
   float result = 0.0f;
-  for (uint32_t i = 0; i < v1->dim; i++) {
-    result += std::abs(v1->data[i] - v2->data[i]);
+  for (uint32_t i = 0; i < dim; i++) {
+    result += std::abs(a[i] - b[i]);
   }
   return result;
 }
 
+static V_FUNC_ALWAYS_INLINE double dist_l1(const Data *v1, const Data *v2) {
+  return dist_l1(v1->data, v2->data, v1->dim);
+}
+
 // Squared L2 distance between two vectors (without sqrt for efficiency)
-static V_FUNC_ALWAYS_INLINE double dist_squared_l2(const Data *v1,
-                                                   const Data *v2) {
-  const float *a = v1->data;
-  const float *b = v2->data;
-  const float *end = a + v1->dim;
+static V_FUNC_ALWAYS_INLINE double
+dist_squared_l2(const float *a, const float *b, uint32_t dim) {
+  const float *end = a + dim;
 
   // Use pointer iteration (helps vectorization)
   float result = 0.0f;
@@ -235,17 +242,23 @@ static V_FUNC_ALWAYS_INLINE double dist_squared_l2(const Data *v1,
   return result;
 }
 
+static V_FUNC_ALWAYS_INLINE double dist_squared_l2(const Data *v1,
+                                                   const Data *v2) {
+  return dist_squared_l2(v1->data, v2->data, v1->dim);
+}
+
 // L2 distance (Euclidean distance) between two vectors
 static V_FUNC_ALWAYS_INLINE double dist_l2(const Data *v1, const Data *v2) {
   return std::sqrt(dist_squared_l2(v1, v2));
 }
 
 // Cosine distance between two vectors
-static V_FUNC_ALWAYS_INLINE double dist_cosine(const Data *v1, const Data *v2) {
+static V_FUNC_ALWAYS_INLINE double dist_cosine(const float *a, const float *b,
+                                               uint32_t dim) {
   float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
-  for (uint32_t i = 0; i < v1->dim; i++) {
-    float x = v1->data[i];
-    float y = v2->data[i];
+  for (uint32_t i = 0; i < dim; i++) {
+    float x = a[i];
+    float y = b[i];
     dot += x * y;
     norm1 += x * x;
     norm2 += y * y;
@@ -264,14 +277,23 @@ static V_FUNC_ALWAYS_INLINE double dist_cosine(const Data *v1, const Data *v2) {
   return 1.0;  // Maximum distance
 }
 
+static V_FUNC_ALWAYS_INLINE double dist_cosine(const Data *v1, const Data *v2) {
+  return dist_cosine(v1->data, v2->data, v1->dim);
+}
+
 // Inner product (dot product) between two vectors
-static V_FUNC_ALWAYS_INLINE double dist_inner_product(const Data *v1,
-                                                      const Data *v2) {
+static V_FUNC_ALWAYS_INLINE double
+dist_inner_product(const float *a, const float *b, uint32_t dim) {
   float result = 0.0f;
-  for (uint32_t i = 0; i < v1->dim; i++) {
-    result += v1->data[i] * v2->data[i];
+  for (uint32_t i = 0; i < dim; i++) {
+    result += a[i] * b[i];
   }
   return result;
+}
+
+static V_FUNC_ALWAYS_INLINE double dist_inner_product(const Data *v1,
+                                                      const Data *v2) {
+  return dist_inner_product(v1->data, v2->data, v1->dim);
 }
 
 // Calculate L2 norm (Euclidean norm) of a vector
