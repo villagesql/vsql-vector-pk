@@ -82,12 +82,15 @@ public:
   // (>= the decoded float length). prefix is the storage-ref header stripped
   // off each value before its floats.
   DistanceEvaluator(const char *helper_name, size_t buf_size, uint32_t prefix)
-      : m_fn(native::dist_for_name(helper_name)), m_prefix(prefix),
+      : m_fn(native::dist_for_name(helper_name)),
+        m_qmetric(native::quantized_metric_for_name(helper_name)),
+        m_prefix(prefix),
         m_scratch_a(buf_size), m_scratch_b(buf_size),
         m_qbuf_a(max_qdata_length(buf_size, prefix)),
         m_qbuf_b(max_qdata_length(buf_size, prefix)) {
-    if (m_fn == nullptr && helper_name != nullptr) {
-      // Keep the name for eval()'s error; the buffer is small and fixed.
+    if ((m_fn == nullptr || m_qmetric == native::QuantizedMetric::NONE) &&
+        helper_name != nullptr) {
+      // Keep the name for eval()'s errors; the buffer is small and fixed.
       std::strncpy(m_helper_name, helper_name, sizeof(m_helper_name) - 1);
     }
   }
@@ -99,8 +102,8 @@ public:
   // operand quantized: a vector the cache refused stays in its stored form,
   // and eval() picks the kernel per comparison.
   //
-  // L2 only for now: quantize.h has dist_squared_l2_q and nothing else, and
-  // IndexGraph::set_vector_cache() refuses a cache on other metrics.
+  // Only for a metric with a quantized kernel (native::has_quantized_kernel);
+  // IndexGraph::set_vector_cache() refuses a cache on any other.
   void set_quantized(uint32_t padded_dim) {
     m_quantized = true;
     m_padded_dim = padded_dim;
@@ -264,8 +267,23 @@ public:
     if (m_fn == nullptr) {
       return unresolved(err);
     }
-    out = quant::dist_squared_l2_q(a, b, m_padded_dim);
-    return false;
+    switch (m_qmetric) {
+      case native::QuantizedMetric::L2_SQUARED:
+        out = quant::dist_squared_l2_q(a, b, m_padded_dim);
+        return false;
+      case native::QuantizedMetric::COSINE:
+        out = quant::dist_cosine_q(a, b, m_padded_dim);
+        return false;
+      case native::QuantizedMetric::NEGATIVE_INNER_PRODUCT:
+        out = quant::dist_negative_inner_product_q(a, b, m_padded_dim);
+        return false;
+      case native::QuantizedMetric::NONE:
+        break;
+    }
+    snprintf(err.data(), err.size(),
+             "HNSW: distance: no quantized kernel for helper '%s'",
+             m_helper_name);
+    return true;
   }
 
   // Decodes the raw stored value v into buf, which must be buf_len bytes
@@ -346,6 +364,8 @@ private:
   }
 
   NativeDistFn m_fn;
+  // The int16 kernel for the same metric, NONE if it has none.
+  native::QuantizedMetric m_qmetric;
   uint32_t m_prefix;
   // Scratch for each operand when it cannot be read in place. Two buffers so
   // both are live at once for the kernel call.
@@ -367,8 +387,8 @@ private:
   // set_quantized_fixed_operand().
   const quant::QData *m_qa = nullptr;
   const unsigned char *m_fixed_f32_src = nullptr;
-  // The bound helper name, kept only when it did not resolve, for eval()'s
-  // error message. Same 64-byte cap the server name lookup uses.
+  // The bound helper name, kept only when it did not resolve to both kernels,
+  // for eval()'s error messages. Same 64-byte cap the server name lookup uses.
   char m_helper_name[64] = {};
 };
 
