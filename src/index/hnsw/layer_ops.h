@@ -184,6 +184,12 @@ struct VisitedSetFor<Graph, Node, std::void_t<typename Graph::VisitedSet>> {
 //   // 'level' is the node's own level, as passed to search()/seed() below.
 //   bool neighbours(const Node&, LevelId level, std::vector<Node>& out);
 //
+// Graph may also provide, as a pair, hints that only start memory loads and
+// must not change any result; evaluate_distances_with() calls them when
+// present:
+//   void prefetch_lookup(const Node&);  // what finding node's vector reads
+//   void prefetch_vector(const Node&);  // node's vector itself
+//
 // Graph::Node must provide:
 //   using KeyType = ...;  // Hashable and equality comparable.
 //   KeyType key() const;
@@ -342,6 +348,12 @@ private:
   bool evaluate_distances_with(const Query &query,
                                std::vector<Candidate> &candidates,
                                size_t begin);
+
+  // How many candidates ahead of the one being computed
+  // evaluate_distances_with() prefetches the vector of. One is enough when a
+  // vector's load takes about as long as one distance; raise it if the loads
+  // still arrive late.
+  static constexpr size_t PREFETCH_AHEAD = 1;
 
   // Seeds m_visited, m_candidates and m_results from the entry points
   // (Algorithm 2, lines 1-3). Returns true if a graph operation fails.
