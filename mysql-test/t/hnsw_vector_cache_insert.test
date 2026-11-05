@@ -1,0 +1,66 @@
+# Inserting into an HNSW index with the vector cache on must not retire cache
+# entries.
+#
+# An insert compares its new node against neighbours whose lists it overflows
+# (shrink_neighbours). If that comparison fetched the new node back by VID, the
+# vector cache would admit it, and the invalidate at the end of insert() would
+# then retire the entry it had just admitted: one dead slot per insert, which a
+# fill-once cache never reclaims. create_node() instead seeds the insert's
+# per-call vectors with the new node, so nothing is admitted during its own
+# insert and the invalidate finds nothing live.
+#
+# M = 2 keeps neighbour lists short, so nearly every insert after the first few
+# overflows some neighbour and takes the shrink path. The vectors are distinct
+# so the build is not degenerate.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+SET @saved_cache_mode = @@GLOBAL.vsql_vector.cache_mode;
+SET GLOBAL vsql_vector.cache_mode = 1;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 2, ef_construction = 16)
+) ENGINE=InnoDB;
+
+SELECT VARIABLE_VALUE INTO @tomb0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+SELECT VARIABLE_VALUE INTO @miss0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_misses';
+
+# Each vector is passed to FROM_STRING as a literal: a computed string argument
+# leaves the dimension unknown and the insert into SVECTOR(4) fails to decode.
+--disable_query_log
+--let $i = 1
+while ($i <= 300)
+{
+  --let $a = query_get_value(SELECT SIN($i) AS x, x, 1)
+  --let $b = query_get_value(SELECT COS($i) AS x, x, 1)
+  --let $c = query_get_value(SELECT SIN($i * 0.7) AS x, x, 1)
+  --let $d = query_get_value(SELECT COS($i * 1.3) AS x, x, 1)
+  --eval INSERT INTO t VALUES ($i, SVECTOR::FROM_STRING('[$a, $b, $c, $d]'))
+  --inc $i
+}
+--enable_query_log
+
+SELECT VARIABLE_VALUE INTO @tomb1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+SELECT VARIABLE_VALUE INTO @miss1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_misses';
+
+SELECT COUNT(*) AS rows_inserted FROM t;
+
+--echo # The cache was in use: the inserts' searches missed and filled it.
+SELECT @miss1 - @miss0 > 0 AS cache_used;
+
+--echo # No entry was retired: each new node was compared from its seeded entry,
+--echo # never admitted to the cache during its own insert.
+SELECT @tomb1 - @tomb0 AS tombstones;
+
+DROP TABLE t;
+SET GLOBAL vsql_vector.cache_mode = @saved_cache_mode;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
