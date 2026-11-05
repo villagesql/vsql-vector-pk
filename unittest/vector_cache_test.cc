@@ -210,6 +210,35 @@ void test_zero_budget_refuses_everything() {
   assert(c.entries() == 0);
 }
 
+// peek() finds the same entry get() does but counts neither a hit nor a miss,
+// since the comparison it looks ahead for calls get() and counts there. The
+// prefetch calls only start loads: the cache is unchanged by them, including
+// one with no capacity at all.
+void test_peek_and_prefetch_do_not_count() {
+  VectorCache c = make_cache(2);
+  const std::vector<float> v = vec(1);
+  const svector::quant::QData *in = c.insert(vid(10), v.data());
+  assert(in != nullptr);
+
+  const long long hits = svector::hnsw::vcache_hits;
+  const long long misses = svector::hnsw::vcache_misses;
+  c.prefetch_bucket(vid(10));
+  c.prefetch_bucket(vid(11));
+  assert(c.peek(vid(10)) == in);
+  assert(c.peek(vid(11)) == nullptr);
+  c.prefetch_entry(in);
+  assert(svector::hnsw::vcache_hits == hits);
+  assert(svector::hnsw::vcache_misses == misses);
+  assert(c.get(vid(10)) == in);
+  assert(svector::hnsw::vcache_hits == hits + 1);
+  assert(c.entries() == 1);
+
+  VectorCache empty = make_cache(0);
+  empty.prefetch_bucket(vid(10));
+  assert(empty.peek(vid(10)) == nullptr);
+  assert(svector::hnsw::vcache_misses == misses);
+}
+
 // ---------------------------------------------------------------------------
 // Operand forms
 //
@@ -318,6 +347,7 @@ int main() {
   test_probe_finds_keys_past_a_tombstone();
   test_set_max_bytes_reports_rather_than_resizes();
   test_zero_budget_refuses_everything();
+  test_peek_and_prefetch_do_not_count();
   test_all_operand_combinations_agree();
   test_two_refused_operands_do_not_share_a_buffer();
   std::printf("All vector cache tests passed.\n");

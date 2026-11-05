@@ -120,6 +120,7 @@
 #define VILLAGESQL_VSQL_VECTOR_SRC_INDEX_HNSW_VECTOR_CACHE_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -138,6 +139,34 @@ public:
 
   // Look up vid. Returns the resident QData, or nullptr on a miss.
   const quant::QData *get(VID vid);
+
+  // As get(), but counts neither a hit nor a miss. For a look-ahead that
+  // finds an entry only to prefetch it: the comparison that follows calls
+  // get() itself, so counting here would count that lookup twice.
+  const quant::QData *peek(VID vid);
+
+  // Starts loading vid's index bucket into the CPU cache without reading it,
+  // so a get() or peek() of vid shortly after does not wait on memory. Issued
+  // for every candidate of a batch at once, the bucket misses overlap instead
+  // of being paid one after another.
+  void prefetch_bucket(VID vid) const {
+    if (m_capacity == 0) return;
+    __builtin_prefetch(&m_index[static_cast<size_t>(mix(vid.value) &
+                                                    m_index_mask)]);
+  }
+
+  // Starts loading every cache line of entry q, which peek() or get()
+  // returned. The whole entry, not just its first line: the kernel reads it
+  // end to end straight away, before a hardware prefetcher would have seen
+  // enough of the stream to run ahead of it.
+  void prefetch_entry(const quant::QData *q) const {
+    constexpr uintptr_t kLine = 64;
+    const auto begin = reinterpret_cast<uintptr_t>(q) & ~(kLine - 1);
+    const auto end = reinterpret_cast<uintptr_t>(q) + m_entry_bytes;
+    for (uintptr_t p = begin; p < end; p += kLine) {
+      __builtin_prefetch(reinterpret_cast<const void *>(p));
+    }
+  }
 
   // Quantize `dim` floats at `src` and make the result resident for vid,
   // returning the entry. Returns NULLPTR when the cache is full: nothing is
