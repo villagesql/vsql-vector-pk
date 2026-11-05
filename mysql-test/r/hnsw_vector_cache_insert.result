@@ -1,0 +1,34 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+SET @saved_cache_mode = @@GLOBAL.vsql_vector.cache_mode;
+SET GLOBAL vsql_vector.cache_mode = 1;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL,
+INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 2, ef_construction = 16)
+) ENGINE=InnoDB;
+SELECT VARIABLE_VALUE INTO @tomb0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+SELECT VARIABLE_VALUE INTO @miss0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_misses';
+SELECT VARIABLE_VALUE INTO @tomb1 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+SELECT VARIABLE_VALUE INTO @miss1 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_misses';
+SELECT COUNT(*) AS rows_inserted FROM t;
+rows_inserted
+300
+# The cache was in use: the inserts' searches missed and filled it.
+SELECT @miss1 - @miss0 > 0 AS cache_used;
+cache_used
+1
+# No entry was retired: each new node was compared from its seeded entry,
+# never admitted to the cache during its own insert.
+SELECT @tomb1 - @tomb0 AS tombstones;
+tombstones
+0
+DROP TABLE t;
+SET GLOBAL vsql_vector.cache_mode = @saved_cache_mode;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
