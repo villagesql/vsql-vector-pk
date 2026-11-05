@@ -17,7 +17,7 @@ INSTALL EXTENSION vsql_vector;
 SET SESSION debug='+d,villagesql_custom_index_proceed';
 
 --echo # --- Initial state: empty ---
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- CREATE TABLE with multiple SVECTOR columns and multiple inline HNSW indexes ---
 CREATE TABLE t1 (
@@ -33,39 +33,39 @@ CREATE TABLE t1 (
 ) ENGINE=InnoDB;
 
 SHOW CREATE TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- CREATE INDEX: add an HNSW index on a not-yet-indexed column ---
 CREATE INDEX idx_d ON t1 (d hnsw_l1) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- ALTER TABLE ADD INDEX: HNSW index on another not-yet-indexed column ---
 ALTER TABLE t1 ADD INDEX idx_e (e hnsw_l2) USING EXTENDED(hnsw) WITH (M = 4, ef_construction = 32);
 SHOW CREATE TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 if ($restart) {
   --echo # --- Restart server: verify HNSW indexes and metadata survive a restart before any index is dropped ---
   --source include/restart_mysqld.inc
   SET SESSION debug='+d,villagesql_custom_index_proceed';
   SHOW CREATE TABLE t1;
-  --source include/villagesql/query_custom_indexes.inc
+  --source query_custom_indexes_masked.inc
 }
 
 --echo # --- DROP INDEX: remove a single HNSW index ---
 DROP INDEX idx_d ON t1;
 SHOW CREATE TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- ALTER TABLE DROP INDEX: remove multiple HNSW indexes at once ---
 ALTER TABLE t1 DROP INDEX idx_b, DROP INDEX idx_e;
 SHOW CREATE TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- DROP TABLE: removes all remaining HNSW index metadata ---
 DROP TABLE t1;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- Second table: build up HNSW indexes purely via CREATE INDEX / ALTER TABLE ADD INDEX ---
 CREATE TABLE t2 (
@@ -76,30 +76,30 @@ CREATE TABLE t2 (
 ) ENGINE=InnoDB;
 
 SHOW CREATE TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 CREATE INDEX idx_x ON t2 (x) USING EXTENDED(hnsw);
 CREATE INDEX idx_y ON t2 (y hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 16, ef_construction = 200);
 SHOW CREATE TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- ALTER TABLE ADD INDEX: HNSW index on a not-yet-indexed column ---
 ALTER TABLE t2 ADD INDEX idx_z (z hnsw_inner_product) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- Tear down purely via DROP INDEX / ALTER TABLE DROP INDEX / DROP TABLE ---
 DROP INDEX idx_x ON t2;
 SHOW CREATE TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 ALTER TABLE t2 DROP INDEX idx_y;
 SHOW CREATE TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # --- DROP TABLE: removes all remaining HNSW index metadata ---
 DROP TABLE t2;
---source include/villagesql/query_custom_indexes.inc
+--source query_custom_indexes_masked.inc
 
 --echo # HNSW create/drop index lifecycle test completed
 
