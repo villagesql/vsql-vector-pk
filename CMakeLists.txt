@@ -53,10 +53,12 @@ add_library(svector SHARED
     src/index/hnsw/graph.cc
     src/index/hnsw/graph_ops.cc
     src/index/hnsw/layer_ops.cc
+    src/index/hnsw/vector_cache.cc
     src/storage/data_page.cc
     src/storage/root_page.cc
     src/storage/storage.cc
     src/native_vector.cc
+    src/quantize.cc
     src/vector.cc
 )
 
@@ -130,10 +132,11 @@ target_compile_options(graph_ops_test PRIVATE -UNDEBUG)
 
 add_test(NAME graph_ops_test COMMAND graph_ops_test)
 
-# DistanceEvaluator test. Header-only like the graph/layer tests, but the
-# evaluator takes Column::Data from the SDK, so it needs the SDK include dir.
+# DistanceEvaluator test. The evaluator takes Column::Data from the SDK, so it
+# needs the SDK include dir, and its quantized path calls quant::quantize().
 add_executable(distance_evaluator_test
     unittest/distance_evaluator_test.cc
+    src/quantize.cc
 )
 
 target_include_directories(distance_evaluator_test PRIVATE
@@ -143,6 +146,24 @@ target_include_directories(distance_evaluator_test PRIVATE
 target_compile_options(distance_evaluator_test PRIVATE -UNDEBUG)
 
 add_test(NAME distance_evaluator_test COMMAND distance_evaluator_test)
+
+# DecodedVectorCache test: the per-insert vector entries, including the seeded
+# entry for the vector being inserted, and which kernel each pair of entries
+# runs. Same SDK and quantize.cc needs as the DistanceEvaluator test, plus
+# native_vector.cc for the decode each stored entry goes through.
+add_executable(decoded_vector_cache_test
+    unittest/decoded_vector_cache_test.cc
+    src/native_vector.cc
+    src/quantize.cc
+)
+
+target_include_directories(decoded_vector_cache_test PRIVATE
+    ${VillageSQLExtensionFramework_INCLUDE_DIR}
+)
+
+target_compile_options(decoded_vector_cache_test PRIVATE -UNDEBUG)
+
+add_test(NAME decoded_vector_cache_test COMMAND decoded_vector_cache_test)
 
 # Storage-layer test. Unlike the header-only graph/layer tests, it drives the
 # real column-storage sources against an in-memory fake storage backend, so it
@@ -161,3 +182,20 @@ target_include_directories(storage_test PRIVATE
 target_compile_options(storage_test PRIVATE -UNDEBUG)
 
 add_test(NAME storage_test COMMAND storage_test)
+
+# Vector-cache test. Compiles the cache and the quantization kernel it stores
+# entries in; needs the SDK include dir for the Column/VID types the cache keys
+# on.
+add_executable(vector_cache_test
+    unittest/vector_cache_test.cc
+    src/index/hnsw/vector_cache.cc
+    src/quantize.cc
+)
+
+target_include_directories(vector_cache_test PRIVATE
+    ${VillageSQLExtensionFramework_INCLUDE_DIR}
+)
+
+target_compile_options(vector_cache_test PRIVATE -UNDEBUG)
+
+add_test(NAME vector_cache_test COMMAND vector_cache_test)

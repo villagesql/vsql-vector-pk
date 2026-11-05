@@ -785,6 +785,68 @@ void IndexStore::build_storage_specs(std::vector<Storage_spec> &specs) {
   }
 }
 
+// The mode and the budget are read per call rather than captured, so a later
+// move from a session variable to a per-index setting touches only this
+// function. Creating the cache lazily also means an index queried only in
+// CACHE_NONE mode never allocates one.
+VectorCache *IndexStore::vector_cache(uint32_t dim) {
+  // Serializes construction and replacement against other scans starting at
+  // the same time: without it two threads both construct and one result is
+  // leaked, or one frees a cache the other has just taken a pointer to. Held
+  // only here, at the start of a scan -- never during traversal, and never
+  // while a storage latch is held, so it sits outside the lock hierarchy in
+  // graph.h rather than under it.
+  //
+  // It does NOT make the cache safe to drop while a scan is running; see
+  // below.
+  std::lock_guard<std::mutex> guard(m_vector_cache_mutex);
+  const long long mode = read_cache_mode();
+  // Only CACHE_VECTORS is implemented; the sysvar refuses anything higher
+  // (MAX_IMPLEMENTED_CACHE_MODE), so this is the whole mapping today. When the
+  // pinned-skeleton modes land they branch here.
+  assert(mode <= MAX_IMPLEMENTED_CACHE_MODE);
+  if (mode < CACHE_VECTORS) {
+    // Mode turned off under a cache that already exists: retire it, so the
+    // memory is returned rather than held for a mode nobody is using.
+    retire_vector_cache();
+    return nullptr;
+  }
+  const auto budget = static_cast<size_t>(read_max_cache_size());
+  if (budget == 0) {
+    retire_vector_cache();
+    return nullptr;
+  }
+  // A budget change cannot be applied to a live cache -- slots are sized and
+  // placed once -- so it is honoured by replacing the cache. Dropping it here
+  // is safe for the same reason the rest of the cache is: this runs at the
+  // start of a scan, before any entry pointer has been handed out.
+  if (m_vector_cache != nullptr && m_vector_cache->set_max_bytes(budget))
+    retire_vector_cache();
+  if (m_vector_cache == nullptr)
+    m_vector_cache = std::make_unique<VectorCache>(
+        budget, dim, quant::qvector_padded_dim(dim));
+  return m_vector_cache.get();
+}
+
+// A cache being replaced is not freed: a scan that started earlier still holds
+// a raw pointer to it, and to entries inside it. Nothing tracks those readers,
+// so the old cache is parked here and released only when the store itself is
+// destroyed.
+//
+// That is a deliberate leak, bounded by how often the budget or the mode
+// changes -- both operator actions, not workload events. The alternative is
+// refcounting every scan's use of the cache, which puts an atomic on the one
+// path this whole design exists to keep free of them. Revisit if a workload
+// ever flips these settings often enough for the retained caches to matter.
+void IndexStore::retire_vector_cache() {
+  if (m_vector_cache != nullptr)
+    m_retired_vector_caches.push_back(std::move(m_vector_cache));
+}
+
+void IndexStore::invalidate_vector_cache(VID vid) {
+  if (m_vector_cache != nullptr) m_vector_cache->invalidate(vid);
+}
+
 bool IndexStore::create(const PkLayout &pk_layout, Space::Ref space_ref,
                         Segment::TrxRef trx_ref, const Options &opts, char *err,
                         uint32_t err_len) {
@@ -946,6 +1008,14 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   IndexGraph graph(*ctx->user(), index, trx_ref,
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
+  // Construction searches the graph far more than a query does, and reads the
+  // same existing vectors through the same funnel, so it benefits from the
+  // cache too. Safe because the cache is keyed by VID and this insert's own
+  // vector gets a fresh one -- it cannot collide with an entry, and the
+  // vectors it reads are not the ones it is writing.
+  graph.set_vector_cache(ctx->user()->vector_cache(
+      (index.get_max_col_len(VECTOR_KEY_POS) - IndexStore::KEY_REF_SIZE) /
+      static_cast<uint32_t>(sizeof(float))));
 
   // HAS_ROW_REF: the server hands the owning row's primary key in pkey_columns
   // (one entry per key column). The index stores it on the level-0 node -- an
@@ -954,9 +1024,24 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   IndexGraph::NodeData node_data{key_columns[VECTOR_KEY_POS]};
   node_data.pkey_parts = pkey_columns;
   node_data.num_pkey_parts = index.get_primary_num_key_cols();
+  // The vector being inserted is not in the index yet, so the construction
+  // search would otherwise compare it as f32 against quantized neighbours.
+  // node_data.data must keep the ORIGINAL encoded bytes -- create_node() hands
+  // them to the server to store -- so the quantized form rides alongside in
+  // qdata rather than replacing it.
+  if (graph.prepare_external_operand(node_data)) return true;
   Node top_node;
   if (GraphOperations<IndexGraph>(graph).insert(node_data, top_node))
     return true;
+
+  // Belt and braces against a reused VID: purge() invalidates on the way out,
+  // but a VID freed in a session that never ran a purge through this cache --
+  // or freed before the cache existed -- would otherwise serve the previous
+  // occupant's vector. Dropping the entry for a VID we have just written costs
+  // one hash erase per insert. Only a stale entry can be found here: the insert
+  // itself never admits its own VID, because create_node() seeds the graph's
+  // per-call vectors with it (IndexGraph::seed_node_vector()).
+  ctx->user()->invalidate_vector_cache(top_node.vid);
 
   *key_ref = static_cast<IndexScanKey::KeyPartRef>(top_node.nid.value);
   return false;
@@ -1014,6 +1099,10 @@ bool purge(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   if (level_store->resolve_owner(nid, target, err, err_len))
     return true;
 
+  // The VID is about to be freed and can be handed to a later insert, which
+  // would otherwise be served this vector's bytes from the cache.
+  store->invalidate_vector_cache(target.vid);
+
   IndexGraph graph(*store, index, trx_ref,
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
@@ -1032,8 +1121,17 @@ bool begin(StorageCtx *ctx, const Index &index, MtrCtx::Ref /*mctx*/,
   IndexGraph graph(*ctx->user(), index, Segment::TrxRef{},
                    index.get_max_col_len(VECTOR_KEY_POS),
                    std::span<char>(err, err_len));
+  // Cache is owned by the store, so it outlives this per-scan graph and the
+  // next query sees what this one loaded. Null in CACHE_NONE.
+  graph.set_vector_cache(ctx->user()->vector_cache(
+      (index.get_max_col_len(VECTOR_KEY_POS) - IndexStore::KEY_REF_SIZE) /
+      static_cast<uint32_t>(sizeof(float))));
 
   IndexGraph::NodeData query{scan_desc[0][VECTOR_KEY_POS]};
+  // The query vector never passes through the cache -- it is not in the index
+  // -- so quantize it here to match the operands it is about to be compared
+  // against. Once per search.
+  if (graph.prepare_external_operand(query)) return true;
   const uint32_t k = scan_desc.limit();
   const uint32_t ef_search =
       std::max<uint32_t>(k, static_cast<uint32_t>(read_ef_search()));

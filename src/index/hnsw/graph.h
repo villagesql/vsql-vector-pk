@@ -26,6 +26,7 @@
 
 #include "decoded_vector_cache.h"
 #include "distance_evaluator.h"
+#include "vector_cache.h"
 #include "hnsw.h"
 #include "storage.h"
 #include <array>
@@ -141,6 +142,8 @@ struct GraphContext {
                size_t max_update_chunks, std::span<char> error)
       : m_neighbour_buf(neighbour_buf_size), m_overflow_buf(overflow_buf_size),
         m_vector_buf_1(vector_buf_size), m_vector_buf_2(vector_buf_size),
+        m_query_qbuf(DistanceEvaluator::max_qdata_length(
+            vector_buf_size, IndexStore::KEY_REF_SIZE)),
         m_update_slots(max_update_slots), m_link_slots(max_update_slots),
         m_chunk_ids(max_update_chunks), m_node_buf_1(max_update_slots),
         m_node_buf_2(max_update_slots), m_incoming_buf_1(max_update_slots),
@@ -150,6 +153,10 @@ struct GraphContext {
   ScratchBytes m_overflow_buf;
   ScratchBytes m_vector_buf_1;
   ScratchBytes m_vector_buf_2;
+  // Holds the quantized form of a vector that never passes through the cache
+  // because it is not in the index -- the query vector, or the one being
+  // inserted. Written once per search, not per distance call.
+  ScratchBytes m_query_qbuf;
 
   ScratchSlots m_update_slots;
   // On-disk slot indices of the incoming-flagged neighbour links
@@ -189,6 +196,17 @@ public:
 
   struct NodeData {
     IndexScanKey::KeyPartData data;
+    // For a vector not in the index (the query, or the one being inserted):
+    // its quantized form, set by prepare_external_operand() when a cache is
+    // attached. Kept SEPARATE from data, which must stay the original encoded
+    // bytes because create_node() hands those to the server to store. Null
+    // when there is no cache, and then `data` is what the distance uses.
+    IndexScanKey::KeyPartData qdata{};
+    bool has_qdata = false;
+    // True when `data` holds a quant::QData rather than encoded bytes -- set
+    // for a vector the cache served or admitted. A vector the cache refused
+    // stays encoded, and its comparison runs the f32 kernel.
+    bool quantized = false;
     // The owning row's primary key, stored on the level-0 node: pkey_parts
     // points at num_pkey_parts KeyPartData (one per key column), owned by the
     // caller for the duration of the insert. num_pkey_parts is 0 for internal
@@ -293,10 +311,13 @@ public:
   IndexGraph(IndexStore &store, const Index &index, Segment::TrxRef trx_ref,
              size_t vector_buf_size, std::span<char> err);
 
-  // Distance between two graph nodes. Each node's vector is fetched and
-  // decoded once per IndexGraph and kept in m_vectors, so comparing the same
-  // nodes again (as the Algorithm-4 heuristic and the neighbour reselection
-  // after an overflowing link do throughout an insert) costs only the kernel.
+  // Distance between two graph nodes. Each node's vector is resolved once per
+  // IndexGraph and kept in m_vectors, so comparing the same nodes again (as
+  // the Algorithm-4 heuristic and the neighbour reselection after an
+  // overflowing link do throughout an insert) costs only the kernel. The
+  // comparison is quantized when either node is held by the vector cache,
+  // matching distance(NodeData, Node), so the heuristic never weighs an f32
+  // distance against a quantized one for the same pair of forms.
   bool distance(const Node &a, const Node &b, DistanceType &out);
 
   bool distance(const NodeData &a, const Node &b, DistanceType &out);
@@ -473,13 +494,73 @@ private:
 
   // Resolves a node's vid -- which is the server's stable column reference for
   // the vector the node indexes -- back to that vector's data, which the server
-  // fills into buf. decoded_vector() resolves into m_vector_buf_1 and
-  // distance(NodeData, Node) into m_vector_buf_2.
+  // fills into buf. node_vector() resolves into m_vector_buf_1 and
+  // distance(NodeData, Node) into m_vector_buf_2. With a vector cache
+  // attached, out may instead point at the cache's QData (out.quantized).
   bool resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out);
 
-  // Points out at node's decoded vector in m_vectors, fetching and decoding it
-  // first if this IndexGraph has not yet. Returns true on error.
-  bool decoded_vector(const Node &node, const native::Data *&out);
+  // Points out at node's entry in m_vectors, resolving it first if this
+  // IndexGraph has not yet. The entry holds the cache's QData when the vector
+  // cache served or admitted the node, and a decoded f32 copy otherwise.
+  // Returns true on error.
+  bool node_vector(const Node &node, DecodedVectorCache::Entry *&out);
+
+  // Records the vector being inserted, as data holds it, as vid's entry in
+  // m_vectors. Called by create_node() as soon as the new node's vid is known,
+  // so the comparisons against it that follow -- shrink_neighbours() offers it
+  // to every neighbour it overflowed -- find it there instead of fetching it
+  // back from the server. That also keeps it out of the vector cache during
+  // its own insert: it compares as the external operand it was for the
+  // search, f32 against a node the cache refused and quantized against one
+  // the cache holds, and insert() has no just-admitted entry to retire when
+  // it invalidates the vid. Returns true on error.
+  bool seed_node_vector(VID vid, const NodeData &data);
+
+public:
+  // Attach a vector cache to sit behind resolve_node_data(), or nullptr for
+  // the uncached paged path. Refused when this index's metric has no
+  // quantized kernel -- the cache stores a quantized form, so attaching one
+  // on, say, a cosine index would be a correctness bug rather than a slow
+  // path. Such an index simply runs as it does today. Not owned: the cache
+  // lives on the IndexStore and outlives any one IndexGraph, which is what
+  // lets it persist across queries.
+  void set_vector_cache(VectorCache *cache) {
+    if (cache != nullptr &&
+        !native::has_quantized_kernel(fetch_distance_helper_name().data()))
+      return;
+    m_vector_cache = cache;
+    // The evaluator learns the padded width once here; which kernel a
+    // comparison runs is still decided per comparison.
+    if (cache != nullptr) m_dist.set_quantized(cache->padded_dim());
+  }
+
+  // Quantize a vector that is not in the index -- the query, or the one being
+  // inserted -- so it matches the cached operands it will be compared against.
+  // A no-op without a cache. Call once before a search, not per distance.
+  bool prepare_external_operand(NodeData &data) {
+    if (m_vector_cache == nullptr) return false;
+    if (m_dist.quantize_operand(data.data, m_ctx.m_query_qbuf, data.qdata,
+                                m_ctx.m_error))
+      return true;
+    data.has_qdata = true;
+    // The f32 form stays in data.data: a comparison against an uncached
+    // vector needs it, so both forms of this operand live for the search.
+    m_dist.set_quantized_fixed_operand(
+        reinterpret_cast<const quant::QData *>(data.qdata.data),
+        data.data.data);
+    return false;
+  }
+
+  // The operand the kernel should see for a NodeData: always its stored
+  // bytes. A prepared quantized form is not selected here -- eval() reaches
+  // for it only when the OTHER operand turned out to be quantized, which is a
+  // per-comparison fact this function cannot see.
+  static const IndexScanKey::KeyPartData &operand(const NodeData &d) {
+    return d.data;
+  }
+
+private:
+  VectorCache *m_vector_cache = nullptr;
 
   // One link in a node's overflow chain: the overflow entry to drop (nid),
   // and the record whose Overflow field currently points to it (prev, of
