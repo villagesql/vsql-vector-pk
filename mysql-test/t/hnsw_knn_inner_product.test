@@ -1,0 +1,66 @@
+# KNN through an hnsw_inner_product index, checked against brute force.
+#
+# As in pgvector, INNER_PRODUCT returns the raw dot product (a similarity:
+# higher means more similar) and NEGATIVE_INNER_PRODUCT returns its negation,
+# which orders like a distance. The index is built and searched with the
+# negated form and serves ORDER BY NEGATIVE_INNER_PRODUCT(v, q), ascending,
+# which is most similar first. INNER_PRODUCT is never served by the index, in
+# either direction.
+#
+# The vectors vary in magnitude as well as direction, since magnitude is what
+# separates inner product from cosine.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_inner_product) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+# Each vector is passed to FROM_STRING as a literal: a computed string argument
+# leaves the dimension unknown and the insert into SVECTOR(4) fails to decode.
+--disable_query_log
+--let $i = 1
+while ($i <= 200)
+{
+  --let $vec = `SELECT CONCAT('[', ROUND(SIN($i) * (1 + $i % 7), 4), ', ', ROUND(COS($i * 1.7) * (1 + $i % 5), 4), ', ', ROUND(SIN($i * 0.3) * (1 + $i % 3), 4), ', ', ROUND(COS($i * 2.3), 4), ']')`
+  --eval INSERT INTO t VALUES ($i, SVECTOR::FROM_STRING('$vec'))
+  --inc $i
+}
+--enable_query_log
+
+--let $q = '[1, 0.5, -0.3, 0.2]'
+
+--echo #
+--echo # 1. INNER_PRODUCT is not served by the index, in either direction.
+--echo #
+--eval EXPLAIN FORMAT=TREE SELECT id FROM t ORDER BY INNER_PRODUCT(v, $q) DESC LIMIT 10
+--eval EXPLAIN FORMAT=TREE SELECT id FROM t ORDER BY INNER_PRODUCT(v, $q) LIMIT 10
+
+--echo #
+--echo # 2. NEGATIVE_INNER_PRODUCT is the negated dot product.
+--echo #
+--eval SELECT COUNT(*) AS mismatches FROM t WHERE NEGATIVE_INNER_PRODUCT(v, $q) <> -INNER_PRODUCT(v, $q)
+
+--echo #
+--echo # 3. NEGATIVE_INNER_PRODUCT ascending is served by the index, most similar
+--echo #    first. It must match brute force, and the most-similar-first
+--echo #    INNER_PRODUCT DESC list.
+--echo #
+--eval EXPLAIN FORMAT=TREE SELECT id FROM t ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+
+--echo # Through the index:
+--eval SELECT id, ROUND(INNER_PRODUCT(v, $q), 4) AS ip FROM t ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+
+--echo # Brute force (primary key scan and sort):
+--eval SELECT id, ROUND(INNER_PRODUCT(v, $q), 4) AS ip FROM t FORCE INDEX (PRIMARY) ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+
+--echo # INNER_PRODUCT DESC (brute force):
+--eval SELECT id, ROUND(INNER_PRODUCT(v, $q), 4) AS ip FROM t ORDER BY INNER_PRODUCT(v, $q) DESC LIMIT 10
+
+DROP TABLE t;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

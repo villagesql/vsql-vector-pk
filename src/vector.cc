@@ -694,23 +694,18 @@ void svector_inner_product(CustomArgWith<SVectorParams> vec1,
   svector_distance_impl(vec1, vec2, out, native::dist_inner_product);
 }
 
-// Graph-distance for the HNSW inner-product profile. INNER_PRODUCT is a
-// SIMILARITY (higher = more similar; see README), but the HNSW graph orders by
-// "smaller = nearer". So the graph distance is the NEGATED dot product: smaller
-// -negated-dot == larger dot == more similar, so the graph builds and searches
-// toward the true (maximum-inner-product) neighbours. Used ONLY by the index
-// profile below; the SQL INNER_PRODUCT() function keeps the raw dot
-// (svector_inner_product above) so users get the real similarity value. Do NOT
-// collapse these two.
-static double neg_dist_inner_product(const native::Data *v1,
-                                     const native::Data *v2) {
-  return -native::dist_inner_product(v1, v2);
-}
-
-void svector_inner_product_graph(CustomArgWith<SVectorParams> vec1,
-                                 CustomArgWith<SVectorParams> vec2,
-                                 RealResult out) {
-  svector_distance_impl(vec1, vec2, out, neg_dist_inner_product);
+// NEGATIVE_INNER_PRODUCT: the negated dot product, as pgvector's <#>.
+// INNER_PRODUCT is a SIMILARITY (higher = more similar; see README), but the
+// HNSW graph orders by "smaller = nearer" and the server only routes an
+// ascending ORDER BY to an index. So the inner-product profile binds this
+// function: ORDER BY NEGATIVE_INNER_PRODUCT(v, q) is most similar first, and
+// the graph is built and searched with the same order. INNER_PRODUCT() keeps
+// the raw dot so users get the real similarity value, and is never served by
+// the index.
+void svector_negative_inner_product(CustomArgWith<SVectorParams> vec1,
+                                    CustomArgWith<SVectorParams> vec2,
+                                    RealResult out) {
+  svector_distance_impl(vec1, vec2, out, native::dist_negative_inner_product);
 }
 
 // Upper bound on SVECTOR's persisted byte size: storage-ref header plus
@@ -770,7 +765,8 @@ static constexpr const char kHNSWProfileInnerProduct[] = "hnsw_inner_product";
 static constexpr const char *kHNSWFuncL1Distance = native::kDistL1;
 static constexpr const char kHNSWFuncL2Distance[] = "l2_distance";
 static constexpr const char *kHNSWFuncCosineDistance = native::kDistCosine;
-static constexpr const char *kHNSWFuncInnerProduct = native::kDistInnerProduct;
+static constexpr const char *kHNSWFuncNegativeInnerProduct =
+    native::kDistNegativeInnerProduct;
 static constexpr const char *kHNSWFuncL2SquaredDistance = native::kDistL2Squared;
 
 // clang-format off
@@ -838,7 +834,8 @@ static const auto HNSW_COSINE_FN =
         .build();
 
 static const auto HNSW_IP_FN =
-    make_index_function<&svector_inner_product_graph>(kHNSWFuncInnerProduct)
+    make_index_function<&svector_negative_inner_product>(
+        kHNSWFuncNegativeInnerProduct)
         .returns(vsql::REAL)
         .param(SVECTOR)
         .param(SVECTOR)
@@ -879,7 +876,7 @@ static const auto HNSW_IP_PROFILE =
         .using_index(kHNSWIndexName)
         .with_function(DISTANCE_PROFILE_FN_ID, HNSW_IP_FN)
         .with_helper(DISTANCE_HELPER_FN_ID, HNSW_IP_FN)
-        .ordering(Index::Ordering::DESC)
+        .ordering(Index::Ordering::ASC)
         .build();
 
 static auto HNSW_INDEX_CAPABILITY =
@@ -993,6 +990,13 @@ VEF_GENERATE_ENTRY_POINTS(
                   .deterministic()
                   .build())
         .func(make_func<&svector_inner_product>("inner_product")
+                  .returns(REAL)
+                  .param(SVECTOR)
+                  .param(SVECTOR)
+                  .deterministic()
+                  .build())
+        .func(make_func<&svector_negative_inner_product>(
+                  "negative_inner_product")
                   .returns(REAL)
                   .param(SVECTOR)
                   .param(SVECTOR)
