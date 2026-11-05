@@ -181,12 +181,109 @@ void test_errors() {
   assert(out == 0);
 }
 
+// A QData buffer, aligned for QData, holding a vector padded to padded_dim.
+struct QBuf {
+  explicit QBuf(uint32_t padded_dim)
+      : words(svector::quant::qdata_length(padded_dim) / sizeof(uint64_t) + 1) {}
+  void *data() { return words.data(); }
+  size_t size() const { return words.size() * sizeof(uint64_t); }
+  std::vector<uint64_t> words;
+};
+
+// Every metric with an int16 kernel gives what its f32 kernel gives, within
+// quantization error, through both the both-quantized and the mixed paths.
+// int16 keeps ~1e-4 of each vector's largest component, so the error bound
+// scales with the vectors' norms, and with nothing for cosine.
+void test_quantized_kernels_match_f32() {
+  const auto va = make_vector(0.5f);
+  const auto vb = make_vector(2.0f);
+  double na = 0, nb = 0;
+  for (uint32_t i = 0; i < kDim; i++) {
+    na += double(va[i]) * va[i];
+    nb += double(vb[i]) * vb[i];
+  }
+  const uint32_t padded = svector::quant::qvector_padded_dim(kDim);
+  const char *metrics[] = {svector::native::kDistL2Squared,
+                           svector::native::kDistCosine,
+                           svector::native::kDistNegativeInnerProduct};
+  for (const char *metric : metrics) {
+    assert(svector::native::has_quantized_kernel(metric));
+    DistanceEvaluator eval(metric, kBufSize, kPrefix);
+    eval.set_quantized(padded);
+    char err[128] = {};
+    QBuf ba(padded), bb(padded);
+    const svector::quant::QData *qa = nullptr, *qb = nullptr;
+    assert(!eval.quantize(va.data(), kDim, ba.data(), ba.size(), &qa, err));
+    assert(!eval.quantize(vb.data(), kDim, bb.data(), bb.size(), &qb, err));
+
+    const double want = expected(metric, va, vb);
+    const double tol =
+        std::strcmp(metric, svector::native::kDistCosine) == 0
+            ? 1e-3
+            : 1e-3 * (std::strcmp(metric, svector::native::kDistL2Squared) == 0
+                          ? na + nb
+                          : std::sqrt(na * nb));
+    double out = 0;
+    assert(!eval.eval(qa, qb, out, err));
+    if (std::fabs(out - want) > tol) {
+      fprintf(stderr, "%s quantized: got %.9g want %.9g\n", metric, out, want);
+      assert(false);
+    }
+    // Mixed: a is cached, b is a stored value quantized for the comparison.
+    Stored b(vb, 0);
+    Column::Data a_q{reinterpret_cast<const unsigned char *>(qa),
+                     static_cast<uint32_t>(svector::quant::qdata_length(padded))};
+    double mixed = 0;
+    assert(!eval.eval(a_q, b.data, true, false, mixed, err));
+    assert(mixed == out);
+  }
+}
+
+// Cosine against a zero vector is the maximum distance in both kernels.
+void test_quantized_cosine_zero_vector() {
+  const auto va = make_vector(0.5f);
+  const std::vector<float> zero(kDim, 0.0f);
+  const uint32_t padded = svector::quant::qvector_padded_dim(kDim);
+  DistanceEvaluator eval(svector::native::kDistCosine, kBufSize, kPrefix);
+  eval.set_quantized(padded);
+  char err[128] = {};
+  QBuf ba(padded), bz(padded);
+  const svector::quant::QData *qa = nullptr, *qz = nullptr;
+  assert(!eval.quantize(va.data(), kDim, ba.data(), ba.size(), &qa, err));
+  assert(!eval.quantize(zero.data(), kDim, bz.data(), bz.size(), &qz, err));
+  double out = 0;
+  assert(!eval.eval(qa, qz, out, err));
+  assert(out == 1.0);
+  assert(svector::native::dist_cosine(va.data(), zero.data(), kDim) == 1.0);
+}
+
+// L1 has no int16 kernel: no cache attaches to an L1 index, and a quantized
+// comparison reaching the evaluator anyway is an error, not a wrong answer.
+void test_l1_has_no_quantized_kernel() {
+  assert(!svector::native::has_quantized_kernel(svector::native::kDistL1));
+  const auto va = make_vector(0.5f);
+  const uint32_t padded = svector::quant::qvector_padded_dim(kDim);
+  DistanceEvaluator eval(svector::native::kDistL1, kBufSize, kPrefix);
+  assert(eval.valid());
+  eval.set_quantized(padded);
+  char err[128] = {};
+  QBuf ba(padded);
+  const svector::quant::QData *qa = nullptr;
+  assert(!eval.quantize(va.data(), kDim, ba.data(), ba.size(), &qa, err));
+  double out = 0;
+  assert(eval.eval(qa, qa, out, err));
+  assert(std::strstr(err, "no quantized kernel") != nullptr);
+}
+
 } // namespace
 
 int main() {
   test_in_place_and_decoded_agree();
   test_fixed_operand_reuse();
   test_errors();
+  test_quantized_kernels_match_f32();
+  test_quantized_cosine_zero_vector();
+  test_l1_has_no_quantized_kernel();
   printf("distance_evaluator_test: OK\n");
   return 0;
 }

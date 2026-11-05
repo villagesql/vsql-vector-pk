@@ -21,14 +21,16 @@
 // along with this program; if not, write to the Free Software
 // Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
-// Scalar int16 quantization for vectors, plus the SIMD squared-L2 kernel over
-// the quantized form. Self-contained: no dependency on the HNSW storage layer.
-// Intended for an in-memory resident quantized vector -- quantize a float
-// vector once when it is materialized, then compare with dist_squared_l2_q.
+// Scalar int16 quantization for vectors, plus SIMD kernels over the quantized
+// form: squared L2, cosine and negated inner product. Self-contained: no
+// dependency on the HNSW storage layer. Intended for an in-memory resident
+// quantized vector -- quantize a float vector once when it is materialized,
+// then compare with one of the dist_*_q kernels.
 //
 // Recipe mirrors MariaDB MHNSW's FVector: per-vector scale = max|v| / 32767,
-// components rounded to int16, and abs2 = 0.5 * ||v||^2 precomputed so squared
-// L2 reduces to a single int16 dot product plus a constant-time combine.
+// components rounded to int16, and abs2 = 0.5 * ||v||^2 precomputed so each
+// metric reduces to a single int16 dot product plus a constant-time combine.
+// L1 has no such form: it needs every per-component difference.
 
 #ifndef VILLAGESQL_VSQL_VECTOR_SRC_QUANTIZE_H
 #define VILLAGESQL_VSQL_VECTOR_SRC_QUANTIZE_H
@@ -156,6 +158,30 @@ static SVECTOR_Q_ALWAYS_INLINE double dist_squared_l2_q(const QData *a,
                                                         uint32_t padded_dim) {
   return dist_squared_l2_q(a->scale, a->abs2, a->dims, b->scale, b->abs2,
                            b->dims, padded_dim);
+}
+
+// Cosine distance, 1 - cos(a, b), between two quantized vectors. The norms
+// come from the precomputed abs2 = 0.5 * ||v||^2, so ||a|| * ||b|| =
+// 2 * sqrt(abs2a * abs2b) and the kernel is still a single int16 dot product.
+// Both norms are of the quantized vectors, the same ones the dot product is
+// taken over, so the cosine stays within [-1, 1]. As native::dist_cosine, a
+// zero or overflowed norm gives the maximum distance 1.
+static SVECTOR_Q_ALWAYS_INLINE double dist_cosine_q(const QData *a,
+                                                    const QData *b,
+                                                    uint32_t padded_dim) {
+  const double dot = double(a->scale) * double(b->scale) *
+                     double(qdot(a->dims, b->dims, padded_dim));
+  const double denom = 2.0 * std::sqrt(double(a->abs2) * double(b->abs2));
+  if (denom > 0.0 && std::isfinite(denom)) return 1.0 - dot / denom;
+  return 1.0;
+}
+
+// Negated inner product between two quantized vectors, as
+// native::dist_negative_inner_product: smaller means more similar.
+static SVECTOR_Q_ALWAYS_INLINE double dist_negative_inner_product_q(
+    const QData *a, const QData *b, uint32_t padded_dim) {
+  return -(double(a->scale) * double(b->scale) *
+           double(qdot(a->dims, b->dims, padded_dim)));
 }
 
 }  // namespace svector::quant
