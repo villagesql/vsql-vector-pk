@@ -31,13 +31,13 @@ t1	CREATE TABLE `t1` (
   KEY `idx_c` (`c` `vsql_vector`.`hnsw_inner_product`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t1	idx_a	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_b	vsql_vector	0.0.1	hnsw	{"M": "8", "ef_construction": "64"}
-test	t1	idx_c	vsql_vector	0.0.1	hnsw	{}
+test	t1	idx_a	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_b	vsql_vector	<VERSION>	hnsw	{"M": "8", "ef_construction": "64"}
+test	t1	idx_c	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t1	idx_a	0	a	vsql_vector	0.0.1	hnsw_l2
-t1	idx_b	0	b	vsql_vector	0.0.1	hnsw_cosine
-t1	idx_c	0	c	vsql_vector	0.0.1	hnsw_inner_product
+t1	idx_a	0	a	vsql_vector	<VERSION>	hnsw_l2
+t1	idx_b	0	b	vsql_vector	<VERSION>	hnsw_cosine
+t1	idx_c	0	c	vsql_vector	<VERSION>	hnsw_inner_product
 # --- CREATE INDEX: add an HNSW index on a not-yet-indexed column ---
 CREATE INDEX idx_d ON t1 (d hnsw_l1) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t1;
@@ -56,15 +56,15 @@ t1	CREATE TABLE `t1` (
   KEY `idx_d` (`d` `vsql_vector`.`hnsw_l1`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t1	idx_a	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_b	vsql_vector	0.0.1	hnsw	{"M": "8", "ef_construction": "64"}
-test	t1	idx_c	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_d	vsql_vector	0.0.1	hnsw	{}
+test	t1	idx_a	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_b	vsql_vector	<VERSION>	hnsw	{"M": "8", "ef_construction": "64"}
+test	t1	idx_c	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_d	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t1	idx_a	0	a	vsql_vector	0.0.1	hnsw_l2
-t1	idx_b	0	b	vsql_vector	0.0.1	hnsw_cosine
-t1	idx_c	0	c	vsql_vector	0.0.1	hnsw_inner_product
-t1	idx_d	0	d	vsql_vector	0.0.1	hnsw_l1
+t1	idx_a	0	a	vsql_vector	<VERSION>	hnsw_l2
+t1	idx_b	0	b	vsql_vector	<VERSION>	hnsw_cosine
+t1	idx_c	0	c	vsql_vector	<VERSION>	hnsw_inner_product
+t1	idx_d	0	d	vsql_vector	<VERSION>	hnsw_l1
 # --- ALTER TABLE ADD INDEX: HNSW index on another not-yet-indexed column ---
 ALTER TABLE t1 ADD INDEX idx_e (e hnsw_l2) USING EXTENDED(hnsw) WITH (M = 4, ef_construction = 32);
 SHOW CREATE TABLE t1;
@@ -84,17 +84,17 @@ t1	CREATE TABLE `t1` (
   KEY `idx_e` (`e` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 32, `m` = 4)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t1	idx_a	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_b	vsql_vector	0.0.1	hnsw	{"M": "8", "ef_construction": "64"}
-test	t1	idx_c	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_d	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_e	vsql_vector	0.0.1	hnsw	{"M": "4", "ef_construction": "32"}
+test	t1	idx_a	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_b	vsql_vector	<VERSION>	hnsw	{"M": "8", "ef_construction": "64"}
+test	t1	idx_c	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_d	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_e	vsql_vector	<VERSION>	hnsw	{"M": "4", "ef_construction": "32"}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t1	idx_a	0	a	vsql_vector	0.0.1	hnsw_l2
-t1	idx_b	0	b	vsql_vector	0.0.1	hnsw_cosine
-t1	idx_c	0	c	vsql_vector	0.0.1	hnsw_inner_product
-t1	idx_d	0	d	vsql_vector	0.0.1	hnsw_l1
-t1	idx_e	0	e	vsql_vector	0.0.1	hnsw_l2
+t1	idx_a	0	a	vsql_vector	<VERSION>	hnsw_l2
+t1	idx_b	0	b	vsql_vector	<VERSION>	hnsw_cosine
+t1	idx_c	0	c	vsql_vector	<VERSION>	hnsw_inner_product
+t1	idx_d	0	d	vsql_vector	<VERSION>	hnsw_l1
+t1	idx_e	0	e	vsql_vector	<VERSION>	hnsw_l2
 # --- DROP INDEX: remove a single HNSW index ---
 DROP INDEX idx_d ON t1;
 SHOW CREATE TABLE t1;
@@ -113,15 +113,15 @@ t1	CREATE TABLE `t1` (
   KEY `idx_e` (`e` `vsql_vector`.`hnsw_l2`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 32, `m` = 4)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t1	idx_a	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_b	vsql_vector	0.0.1	hnsw	{"M": "8", "ef_construction": "64"}
-test	t1	idx_c	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_e	vsql_vector	0.0.1	hnsw	{"M": "4", "ef_construction": "32"}
+test	t1	idx_a	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_b	vsql_vector	<VERSION>	hnsw	{"M": "8", "ef_construction": "64"}
+test	t1	idx_c	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_e	vsql_vector	<VERSION>	hnsw	{"M": "4", "ef_construction": "32"}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t1	idx_a	0	a	vsql_vector	0.0.1	hnsw_l2
-t1	idx_b	0	b	vsql_vector	0.0.1	hnsw_cosine
-t1	idx_c	0	c	vsql_vector	0.0.1	hnsw_inner_product
-t1	idx_e	0	e	vsql_vector	0.0.1	hnsw_l2
+t1	idx_a	0	a	vsql_vector	<VERSION>	hnsw_l2
+t1	idx_b	0	b	vsql_vector	<VERSION>	hnsw_cosine
+t1	idx_c	0	c	vsql_vector	<VERSION>	hnsw_inner_product
+t1	idx_e	0	e	vsql_vector	<VERSION>	hnsw_l2
 # --- ALTER TABLE DROP INDEX: remove multiple HNSW indexes at once ---
 ALTER TABLE t1 DROP INDEX idx_b, DROP INDEX idx_e;
 SHOW CREATE TABLE t1;
@@ -138,11 +138,11 @@ t1	CREATE TABLE `t1` (
   KEY `idx_c` (`c` `vsql_vector`.`hnsw_inner_product`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t1	idx_a	vsql_vector	0.0.1	hnsw	{}
-test	t1	idx_c	vsql_vector	0.0.1	hnsw	{}
+test	t1	idx_a	vsql_vector	<VERSION>	hnsw	{}
+test	t1	idx_c	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t1	idx_a	0	a	vsql_vector	0.0.1	hnsw_l2
-t1	idx_c	0	c	vsql_vector	0.0.1	hnsw_inner_product
+t1	idx_a	0	a	vsql_vector	<VERSION>	hnsw_l2
+t1	idx_c	0	c	vsql_vector	<VERSION>	hnsw_inner_product
 # --- DROP TABLE: removes all remaining HNSW index metadata ---
 DROP TABLE t1;
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
@@ -179,11 +179,11 @@ t2	CREATE TABLE `t2` (
   KEY `idx_y` (`y` `vsql_vector`.`hnsw_cosine`) USING EXTENDED(`vsql_vector`.`hnsw`) WITH (`ef_construction` = 200, `m` = 16)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t2	idx_x	vsql_vector	0.0.1	hnsw	{}
-test	t2	idx_y	vsql_vector	0.0.1	hnsw	{"M": "16", "ef_construction": "200"}
+test	t2	idx_x	vsql_vector	<VERSION>	hnsw	{}
+test	t2	idx_y	vsql_vector	<VERSION>	hnsw	{"M": "16", "ef_construction": "200"}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t2	idx_x	0	x	vsql_vector	0.0.1	hnsw_l2
-t2	idx_y	0	y	vsql_vector	0.0.1	hnsw_cosine
+t2	idx_x	0	x	vsql_vector	<VERSION>	hnsw_l2
+t2	idx_y	0	y	vsql_vector	<VERSION>	hnsw_cosine
 # --- ALTER TABLE ADD INDEX: HNSW index on a not-yet-indexed column ---
 ALTER TABLE t2 ADD INDEX idx_z (z hnsw_inner_product) USING EXTENDED(hnsw);
 SHOW CREATE TABLE t2;
@@ -199,13 +199,13 @@ t2	CREATE TABLE `t2` (
   KEY `idx_z` (`z` `vsql_vector`.`hnsw_inner_product`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t2	idx_x	vsql_vector	0.0.1	hnsw	{}
-test	t2	idx_y	vsql_vector	0.0.1	hnsw	{"M": "16", "ef_construction": "200"}
-test	t2	idx_z	vsql_vector	0.0.1	hnsw	{}
+test	t2	idx_x	vsql_vector	<VERSION>	hnsw	{}
+test	t2	idx_y	vsql_vector	<VERSION>	hnsw	{"M": "16", "ef_construction": "200"}
+test	t2	idx_z	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t2	idx_x	0	x	vsql_vector	0.0.1	hnsw_l2
-t2	idx_y	0	y	vsql_vector	0.0.1	hnsw_cosine
-t2	idx_z	0	z	vsql_vector	0.0.1	hnsw_inner_product
+t2	idx_x	0	x	vsql_vector	<VERSION>	hnsw_l2
+t2	idx_y	0	y	vsql_vector	<VERSION>	hnsw_cosine
+t2	idx_z	0	z	vsql_vector	<VERSION>	hnsw_inner_product
 # --- Tear down purely via DROP INDEX / ALTER TABLE DROP INDEX / DROP TABLE ---
 DROP INDEX idx_x ON t2;
 SHOW CREATE TABLE t2;
@@ -220,11 +220,11 @@ t2	CREATE TABLE `t2` (
   KEY `idx_z` (`z` `vsql_vector`.`hnsw_inner_product`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t2	idx_y	vsql_vector	0.0.1	hnsw	{"M": "16", "ef_construction": "200"}
-test	t2	idx_z	vsql_vector	0.0.1	hnsw	{}
+test	t2	idx_y	vsql_vector	<VERSION>	hnsw	{"M": "16", "ef_construction": "200"}
+test	t2	idx_z	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t2	idx_y	0	y	vsql_vector	0.0.1	hnsw_cosine
-t2	idx_z	0	z	vsql_vector	0.0.1	hnsw_inner_product
+t2	idx_y	0	y	vsql_vector	<VERSION>	hnsw_cosine
+t2	idx_z	0	z	vsql_vector	<VERSION>	hnsw_inner_product
 ALTER TABLE t2 DROP INDEX idx_y;
 SHOW CREATE TABLE t2;
 Table	Create Table
@@ -237,9 +237,9 @@ t2	CREATE TABLE `t2` (
   KEY `idx_z` (`z` `vsql_vector`.`hnsw_inner_product`) USING EXTENDED(`vsql_vector`.`hnsw`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
-test	t2	idx_z	vsql_vector	0.0.1	hnsw	{}
+test	t2	idx_z	vsql_vector	<VERSION>	hnsw	{}
 table_name	index_name	key_position	column_name	extension_name	extension_version	profile_name
-t2	idx_z	0	z	vsql_vector	0.0.1	hnsw_inner_product
+t2	idx_z	0	z	vsql_vector	<VERSION>	hnsw_inner_product
 # --- DROP TABLE: removes all remaining HNSW index metadata ---
 DROP TABLE t2;
 db_name	table_name	index_name	extension_name	extension_version	index_type_name	index_type_parameters
