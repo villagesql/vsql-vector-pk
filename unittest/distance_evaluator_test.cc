@@ -86,7 +86,7 @@ double expected(const char *metric, const std::vector<float> &a,
     return l2;
   if (std::strcmp(metric, svector::native::kDistCosine) == 0)
     return 1.0 - dot / (std::sqrt(na) * std::sqrt(nb));
-  return dot;
+  return -dot;
 }
 
 bool close(double got, double want) {
@@ -95,7 +95,8 @@ bool close(double got, double want) {
 
 constexpr const char *kMetrics[] = {
     svector::native::kDistL1, svector::native::kDistL2Squared,
-    svector::native::kDistCosine, svector::native::kDistInnerProduct};
+    svector::native::kDistCosine,
+    svector::native::kDistNegativeInnerProduct};
 
 // Aligned operands are read in place; operands shifted by 1 byte cannot be,
 // and take the decode path. All four combinations must agree.
@@ -154,6 +155,11 @@ void test_errors() {
   assert(!unknown.valid());
   assert(unknown.eval(a.data, a.data, out, err));
   assert(std::strstr(err, "no_such_distance") != nullptr);
+
+  // The raw inner product is a similarity, not a graph distance, so it does
+  // not resolve: an inner-product index uses the negated form.
+  DistanceEvaluator raw_ip("inner_product", kBufSize, kPrefix);
+  assert(!raw_ip.valid());
 
   DistanceEvaluator eval(svector::native::kDistL2Squared, kBufSize, kPrefix);
   // Dimensions differ.

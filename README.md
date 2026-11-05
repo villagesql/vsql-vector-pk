@@ -138,6 +138,7 @@ INSERT INTO embeddings VALUES (5, '[9.0, 8.0, 7.0, 6.0]', NULL);  -- L1 dist fro
 | `L2_DISTANCE(v1, v2)` | REAL | L2 (Euclidean) distance — square root of sum of squared differences |
 | `COSINE_DISTANCE(v1, v2)` | REAL | Cosine distance — `1 - cosine_similarity`; range [0, 2] |
 | `INNER_PRODUCT(v1, v2)` | REAL | Dot product (similarity, not a metric); higher means more similar |
+| `NEGATIVE_INNER_PRODUCT(v1, v2)` | REAL | Negated dot product; lower means more similar, so `ORDER BY` ascending ranks most similar first (as pgvector's `<#>`) |
 
 Both arguments to a distance/similarity function must have the same dimension. All functions return NULL if either argument is NULL.
 
@@ -211,6 +212,17 @@ distance function matching the index's operator class:
 SELECT id
 FROM docs
 ORDER BY L2_DISTANCE(vec, '[1.0, 2.0, 3.0, 4.0]')
+LIMIT 10;
+```
+
+An `hnsw_inner_product` index is queried with `NEGATIVE_INNER_PRODUCT`, which
+ranks the most similar vectors first in ascending order. `INNER_PRODUCT` is
+never served by the index:
+
+```sql
+SELECT id
+FROM docs
+ORDER BY NEGATIVE_INNER_PRODUCT(vec, '[1.0, 2.0, 3.0, 4.0]')
 LIMIT 10;
 ```
 

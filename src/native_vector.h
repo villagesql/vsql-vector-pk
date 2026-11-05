@@ -296,6 +296,18 @@ static V_FUNC_ALWAYS_INLINE double dist_inner_product(const Data *v1,
   return dist_inner_product(v1->data, v2->data, v1->dim);
 }
 
+// Negated inner product: smaller means more similar, so it orders like a
+// distance. This is what an inner-product index is built and searched with.
+static V_FUNC_ALWAYS_INLINE double
+dist_negative_inner_product(const float *a, const float *b, uint32_t dim) {
+  return -dist_inner_product(a, b, dim);
+}
+
+static V_FUNC_ALWAYS_INLINE double dist_negative_inner_product(const Data *v1,
+                                                               const Data *v2) {
+  return dist_negative_inner_product(v1->data, v2->data, v1->dim);
+}
+
 // Calculate L2 norm (Euclidean norm) of a vector
 static V_FUNC_ALWAYS_INLINE double norm_l2(const Data *v) {
   const float *a = v->data;

@@ -48,15 +48,22 @@ using DistFn = double (*)(const float *, const float *, uint32_t);
 inline constexpr const char kDistL1[] = "l1_distance";
 inline constexpr const char kDistL2Squared[] = "l2_squared_distance";
 inline constexpr const char kDistCosine[] = "cosine_distance";
-inline constexpr const char kDistInnerProduct[] = "inner_product";
+inline constexpr const char kDistNegativeInnerProduct[] =
+    "negative_inner_product";
 
 // Map a metric name to its kernel; nullptr if the name is unknown.
+//
+// The raw inner product has no entry: it is a similarity (higher = more
+// similar), and a graph built with it as its distance links each vector to
+// the ones pointing away from it. An inner-product index is built and searched
+// with the negated form, which orders like a distance.
 inline DistFn dist_for_name(const char *name) {
   if (name == nullptr) return nullptr;
   if (std::strcmp(name, kDistL2Squared) == 0) return &dist_squared_l2;
   if (std::strcmp(name, kDistL1) == 0) return &dist_l1;
   if (std::strcmp(name, kDistCosine) == 0) return &dist_cosine;
-  if (std::strcmp(name, kDistInnerProduct) == 0) return &dist_inner_product;
+  if (std::strcmp(name, kDistNegativeInnerProduct) == 0)
+    return &dist_negative_inner_product;
   return nullptr;
 }
 
