@@ -94,13 +94,6 @@ static constexpr const char kSVectorTypeName[] = "SVECTOR";
 // Enough for sign + decimal + exponent + round-trip precision + NaN/Inf
 constexpr size_t MAX_FLOAT_STR_LENGTH = 16;
 
-// Binary ingest header: a 2-byte big-endian element count whose high bit is
-// set. The set bit marks the value as binary -- a decimal '[...]' literal is
-// ASCII and so always begins below 0x80 -- and masking it off recovers the
-// dimension, which bounds the element payload that follows.
-constexpr size_t kSVectorBinaryHeaderSize = 2;
-constexpr unsigned char kSVectorBinaryTagMask = 0x80;
-
 // Decode buffer for a N-element vector: '[' + float [',' float]* + ']' + '\0'
 template <size_t N>
 constexpr size_t DECODE_BUFFER_SIZE =
@@ -119,80 +112,51 @@ static_assert(native::MAX_VECTOR_DIMENSION <=
                   (SIZE_MAX - sizeof(native::Data)) / sizeof(float),
               "MAX_VECTOR_DIMENSION would overflow native vector allocation");
 
-// The binary header spends its top bit on the binary/decimal tag, leaving 15
-// bits for the element count.
-static_assert(native::MAX_VECTOR_DIMENSION <=
-                  ((1u << 15) - 1),
-              "MAX_VECTOR_DIMENSION does not fit in the 15 dimension bits of "
-              "the binary ingest header");
-
-// True when a value is in the binary form rather than the decimal '[...]' one.
-// The two are told apart by the tag bit alone: a decimal literal is ASCII, so
-// its first byte -- '[' or the whitespace that may pad it -- is always < 0x80,
-// while a binary header's first byte always has the tag set. Nothing in the
-// element bytes, the padding, or the dimension's value can blur that.
-static bool svector_is_binary(std::string_view from) {
-  if (from.empty()) return false;
-  return (static_cast<unsigned char>(from.front()) &
-          kSVectorBinaryTagMask) != 0;
-}
-
-// Decode the binary form: a 2-byte big-endian element count with the tag bit
-// set, followed by that many little-endian float32 elements.
+// The type's binary form, which the server hands over for a value in the binary
+// charset (a _binary literal, a binary parameter, a VARBINARY column): the
+// little-endian float32 elements with no header,
 //
-//     [0x80 | dim_hi][dim_lo][f0 (4B LE)][f1]...[f(dim-1)]
+//     [f0 (4B LE)][f1]...[f(dim-1)]
 //
-// Clients use this instead of formatting a decimal literal, which is far more
-// expensive to build client-side. The dimension bounds the element payload, so
-// a truncated or over-long value is a positive error rather than a vector
-// silently reinterpreted at a different dimension.
-//
-// `from` is used as given: whitespace is never stripped here, because
-// 0x20/0x09/... are ordinary float bytes in a binary payload.
+// which is numpy.asarray(v, '<f4').tobytes(), and what MariaDB's VECTOR takes.
+// Clients use it instead of formatting a decimal literal, which is far more
+// expensive to build client-side. When p is known the length must be exactly
+// its dimension's worth of elements, so a truncated or over-long value is an
+// error rather than a vector reinterpreted at another dimension; when p is
+// unknown the length sets it.
 static void svector_from_binary(MaybeParams<SVectorParams> &p,
-                                std::string_view from, CustomResult out) {
-  if (from.size() < kSVectorBinaryHeaderSize) {
-    out.warning("svector_from_string: binary payload shorter than header");
+                                Span<const unsigned char> from,
+                                CustomResult out) {
+  if (from.size() == 0 || from.size() % sizeof(float) != 0) {
+    out.warning("svector_from_binary: length is not a multiple of 4 bytes");
     return;
   }
-  const size_t declared =
-      ((static_cast<unsigned char>(from[0]) & ~kSVectorBinaryTagMask) << 8) |
-      static_cast<unsigned char>(from[1]);
-  if (declared == 0 ||
-      declared > static_cast<size_t>(native::MAX_VECTOR_DIMENSION)) {
-    out.warning("svector_from_string: invalid dimension");
+  const size_t count = from.size() / sizeof(float);
+  if (count > static_cast<size_t>(native::MAX_VECTOR_DIMENSION)) {
+    out.warning("svector_from_binary: invalid dimension");
     return;
   }
-  if (from.size() - kSVectorBinaryHeaderSize != declared * sizeof(float)) {
-    out.warning(
-        "svector_from_string: binary payload length does not match the "
-        "declared dimension");
-    return;
-  }
-  if (p.is_known() && static_cast<size_t>(p.value().dimension) != declared) {
-    out.warning("svector_from_string: dimension mismatch");
+  if (p.is_known() && static_cast<size_t>(p.value().dimension) != count) {
+    out.warning("svector_from_binary: dimension mismatch");
     return;
   }
 
   auto buf = out.buffer();
-  const size_t need = sizeof(vef_storage_ref_t) + declared * sizeof(float);
+  const size_t need = sizeof(vef_storage_ref_t) + from.size();
   if (buf.size() < need) {
-    out.warning("svector_from_string: buffer too small");
+    out.warning("svector_from_binary: buffer too small");
     return;
   }
   std::memset(buf.data(), 0, sizeof(vef_storage_ref_t));
   unsigned char *dst = buf.data() + sizeof(vef_storage_ref_t);
-  const unsigned char *src =
-      reinterpret_cast<const unsigned char *>(from.data()) +
-      kSVectorBinaryHeaderSize;
   // Re-store each float via float4store so the on-disk encoding is identical
   // to the decimal path and portable regardless of host byte order.
-  for (size_t i = 0; i < declared; ++i) {
+  for (size_t i = 0; i < count; ++i) {
     float value;
-    std::memcpy(&value, src + i * sizeof(float), sizeof(float));
+    std::memcpy(&value, from.data() + i * sizeof(float), sizeof(float));
     native::float4store(dst + i * sizeof(float), value);
   }
-  if (!p.is_known()) p.set(SVectorParams{static_cast<int64_t>(declared)});
+  if (!p.is_known()) p.set(SVectorParams{static_cast<int64_t>(count)});
   out.set_length(need);
 }
 
@@ -202,13 +166,6 @@ static void svector_from_binary(MaybeParams<SVectorParams> &p,
 // hold; expected-dimension mismatch is checked once at the end.
 static void svector_from_string(MaybeParams<SVectorParams> &p,
                                 std::string_view from, CustomResult out) {
-  // A value carrying the binary tag bit is decoded by the binary path; the
-  // rest of this function handles the decimal '[...]' form.
-  if (svector_is_binary(from)) {
-    svector_from_binary(p, from, out);
-    return;
-  }
-
   std::string_view sv = from;
 
   auto is_space = [](char c) {
@@ -725,6 +682,7 @@ constexpr auto SVECTOR = vsql::make_type<kSVectorTypeName>()
                              .params<SVectorParams, &SVectorParams::parse,
                                      &SVectorParams::to_strings>()
                              .from_string<svector_from_string>()
+                             .from_binary<&svector_from_binary>()
                              .to_string<svector_to_string>()
                              .compare<svector_compare>()
                              .int_to_params<svector_get_params>()
