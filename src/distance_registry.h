@@ -67,14 +67,28 @@ inline DistFn dist_for_name(const char *name) {
   return nullptr;
 }
 
-// Whether this metric has a quantized (int16) kernel, and so whether an index
-// on it can attach a vector cache. Only squared L2 today: quantize.h has
-// dist_squared_l2_q and nothing else. Cosine is next and needs normalization
-// at cache-fill time plus its own kernel; inner product needs a kernel; L1 has
-// no precomputable per-vector reduction. The list lives here, next to the
-// names, so adding a metric means touching one place.
+// The metrics with a quantized (int16) kernel in quantize.h. An enum rather
+// than a function pointer so the evaluator's switch inlines the kernel, as
+// it did when squared L2 was the only one.
+enum class QuantizedMetric { NONE, L2_SQUARED, COSINE, NEGATIVE_INNER_PRODUCT };
+
+// Map a metric name to its quantized kernel; NONE if it has none. L1 has no
+// precomputable per-vector reduction, so it never gets one. The list lives
+// here, next to the names, so adding a metric means touching one place.
+inline QuantizedMetric quantized_metric_for_name(const char *name) {
+  if (name == nullptr) return QuantizedMetric::NONE;
+  if (std::strcmp(name, kDistL2Squared) == 0)
+    return QuantizedMetric::L2_SQUARED;
+  if (std::strcmp(name, kDistCosine) == 0) return QuantizedMetric::COSINE;
+  if (std::strcmp(name, kDistNegativeInnerProduct) == 0)
+    return QuantizedMetric::NEGATIVE_INNER_PRODUCT;
+  return QuantizedMetric::NONE;
+}
+
+// Whether this metric has a quantized kernel, and so whether an index on it
+// can attach a vector cache.
 inline bool has_quantized_kernel(const char *name) {
-  return name != nullptr && std::strcmp(name, kDistL2Squared) == 0;
+  return quantized_metric_for_name(name) != QuantizedMetric::NONE;
 }
 
 }  // namespace svector::native
