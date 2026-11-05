@@ -322,6 +322,20 @@ public:
 
   bool distance(const NodeData &a, const Node &b, DistanceType &out);
 
+  // Prefetch hooks for LayerOperations' distance loop, which knows every
+  // candidate of a batch before computing the first distance. Each starts a
+  // memory load early so the misses of a batch overlap: prefetch_lookup()
+  // node's vector cache bucket, prefetch_vector() node's cached vector itself.
+  // No-ops without a vector cache, and for a vector it does not hold.
+  void prefetch_lookup(const Node &node) {
+    if (m_vector_cache != nullptr) m_vector_cache->prefetch_bucket(node.vid);
+  }
+  void prefetch_vector(const Node &node) {
+    if (m_vector_cache == nullptr) return;
+    if (const quant::QData *q = m_vector_cache->peek(node.vid))
+      m_vector_cache->prefetch_entry(q);
+  }
+
   // level is node's own level. Callers always already know it (it's how
   // they located node in the first place), so it's taken directly instead
   // of rediscovering it with a locate() call.

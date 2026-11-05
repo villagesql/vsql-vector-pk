@@ -126,6 +126,32 @@ struct LineGraph {
   }
 };
 
+// LineGraph plus the optional prefetch hooks, recording every hook call and
+// every distance in order so a test can check what was prefetched before it
+// was compared.
+struct PrefetchLineGraph : LineGraph {
+  struct Event {
+    char kind; // 'L' prefetch_lookup, 'V' prefetch_vector, 'D' distance
+    int value;
+  };
+  std::vector<Event> events;
+
+  void prefetch_lookup(const Node &node) {
+    events.push_back({'L', node.value});
+  }
+  void prefetch_vector(const Node &node) {
+    events.push_back({'V', node.value});
+  }
+  bool distance(const Node &a, const Node &b, DistanceType &out) {
+    events.push_back({'D', b.value});
+    return LineGraph::distance(a, b, out);
+  }
+  bool distance(const NodeData &a, const Node &b, DistanceType &out) {
+    events.push_back({'D', b.value});
+    return LineGraph::distance(a, b, out);
+  }
+};
+
 // Consults LineGraph::is_visible(), as a real query-time caller would.
 template <typename Graph> struct VisibilityPolicy {
   using Node = typename Graph::Node;
@@ -155,6 +181,7 @@ template <typename Graph> struct AlwaysVisiblePolicy {
 namespace svector::hnsw {
 template class LayerOperations<LineGraph, VisibilityPolicy>;
 template class LayerOperations<LineGraph, AlwaysVisiblePolicy>;
+template class LayerOperations<PrefetchLineGraph, VisibilityPolicy>;
 } // namespace svector::hnsw
 
 namespace {
@@ -696,6 +723,63 @@ void test_consume_heuristic_extend_candidates_distance_failure_propagates() {
 
 } // namespace
 
+// The prefetch hooks only start memory loads: a graph that has them gets the
+// same result and computes the same distances as one that does not, and each
+// candidate's lookup and vector are prefetched before its distance.
+void test_prefetch_hooks() {
+  LineGraph plain;
+  plain.n = 40;
+  PrefetchLineGraph prefetching;
+  prefetching.n = 40;
+  LineGraph::NodeData query{27};
+
+  svector::hnsw::LayerOperations<LineGraph, VisibilityPolicy> plain_layer(
+      plain, query);
+  svector::hnsw::LayerOperations<PrefetchLineGraph, VisibilityPolicy>
+      prefetching_layer(prefetching, query);
+
+  std::vector<LineGraph::Node> plain_result{LineGraph::Node{0}};
+  std::vector<LineGraph::Node> prefetching_result{LineGraph::Node{0}};
+  assert(!plain_layer.search(plain_result, LineGraph::LevelId{}, 6));
+  assert(!prefetching_layer.search(prefetching_result, LineGraph::LevelId{},
+                                   6));
+  plain_layer.consume_all(plain_result);
+  prefetching_layer.consume_all(prefetching_result);
+  assert(values(plain_result) == values(prefetching_result));
+  assert(plain.distance_calls == prefetching.distance_calls);
+
+  // One lookup and one vector prefetch per distance, each issued before it.
+  int lookups = 0, vectors = 0, distances = 0;
+  for (size_t i = 0; i < prefetching.events.size(); ++i) {
+    const auto &e = prefetching.events[i];
+    if (e.kind == 'L') ++lookups;
+    if (e.kind == 'V') ++vectors;
+    if (e.kind != 'D') continue;
+    ++distances;
+    bool looked_up = false, fetched = false;
+    for (size_t j = 0; j < i; ++j) {
+      const auto &p = prefetching.events[j];
+      if (p.value != e.value) continue;
+      looked_up |= p.kind == 'L';
+      fetched |= p.kind == 'V';
+    }
+    assert(looked_up && fetched);
+  }
+  assert(distances == prefetching.distance_calls);
+  assert(lookups == distances && vectors == distances);
+
+  // A batch issues all its lookups together, before its first vector
+  // prefetch and distance: an 'L' is never preceded by a 'V' (that would be a
+  // lookup issued mid-batch) and is always followed by another 'L' or by the
+  // batch's first 'V'.
+  const auto &ev = prefetching.events;
+  for (size_t i = 0; i < ev.size(); ++i) {
+    if (ev[i].kind != 'L') continue;
+    assert(i == 0 || ev[i - 1].kind != 'V');
+    assert(i + 1 < ev.size() && ev[i + 1].kind != 'D');
+  }
+}
+
 int main() {
   test_basic_knn();
   test_reuse_after_search();
@@ -720,6 +804,7 @@ int main() {
   test_consume_heuristic_is_dominated_distance_failure_propagates();
   test_consume_heuristic_extend_candidates_neighbours_failure_propagates();
   test_consume_heuristic_extend_candidates_distance_failure_propagates();
+  test_prefetch_hooks();
 
   std::printf("All layer_ops tests passed.\n");
   return 0;
