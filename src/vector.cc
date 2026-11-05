@@ -28,6 +28,7 @@
 #include <villagesql/preview/index_builder.h>
 #include <villagesql/preview/session_var.h>
 #include <villagesql/preview/status_var.h>
+#include <villagesql/preview/sys_var.h>
 #include <villagesql/preview/storage_builder.h>
 #include <villagesql/vsql.h>
 
@@ -41,7 +42,7 @@
 #include <limits>
 
 #include "distance_registry.h"
-#include "index/hnsw/layer_ops.h"
+#include "index/hnsw/stats.h"
 #include "index/hnsw/storage.h"
 #include "native_vector.h"
 #include "storage/storage.h"
@@ -887,7 +888,8 @@ static auto HNSW_PROFILE_CAPABILITY = IndexProfileCapability()
                                           .index_profile(HNSW_COSINE_PROFILE)
                                           .index_profile(HNSW_IP_PROFILE);
 
-// vsql_vector.ef_search: per-session HNSW query-time search breadth.
+// Per-session search tuning. ef_search is genuinely per-connection: two
+// sessions can want different search breadth against the same index.
 namespace ssv = vsql::preview_session_var;
 static auto HNSW_SESSION_VARS = ssv::make_capability({
     ssv::make_int(
@@ -900,12 +902,57 @@ static auto HNSW_SESSION_VARS = ssv::make_capability({
 });
 static auto HNSW_EF_SEARCH = HNSW_SESSION_VARS.int_var("ef_search");
 
+// Cache configuration. These describe a SHARED resource -- one cache per
+// index, used by every session -- so they are global, not per-session: two
+// connections cannot each have their own copy of one index's cache, and a
+// session-scoped value would let whichever connection ran first fix the budget
+// while later ones silently resized or dropped the cache underneath it.
+//
+// They still belong on the index rather than on the server, since the cache is
+// per-index:
+//
+//   ALTER INDEX idx_v ON t SET cache_mode = ..., cache_size = ...
+//
+// Everything reads them through read_cache_mode()/read_max_cache_size() at the
+// point of use, so that move is local to those two functions plus
+// IndexStore::vector_cache().
+namespace gsv = vsql::preview_sys_var;
+static long long g_cache_mode = svector::hnsw::DEFAULT_CACHE_MODE;
+static long long g_max_cache_size = svector::hnsw::DEFAULT_MAX_CACHE_SIZE;
+static auto HNSW_CACHE_VARS = gsv::make_capability({
+    gsv::make_int(
+        "cache_mode",
+        "How much of the index is served from memory: 0 = none (pages only), "
+        "1 = vectors (decoded vectors cached by VID). Configures a cache the "
+        "whole index shares.",
+        &g_cache_mode, svector::hnsw::DEFAULT_CACHE_MODE,
+        svector::hnsw::CACHE_NONE,
+        // Capped at the highest IMPLEMENTED mode, not CACHE_FULL. The pinned-
+        // skeleton modes are declared in the enum but not built yet, and
+        // accepting them would silently give mode-1 behaviour -- which would
+        // read as "the skeleton bought nothing" in a benchmark. Raise this as
+        // each mode lands.
+        svector::hnsw::MAX_IMPLEMENTED_CACHE_MODE),
+    gsv::make_int(
+        "max_cache_size",
+        "Upper limit in bytes for one index's vector cache. Configures a cache "
+        "the whole index shares.",
+        &g_max_cache_size, svector::hnsw::DEFAULT_MAX_CACHE_SIZE,
+        svector::hnsw::MIN_MAX_CACHE_SIZE,
+        svector::hnsw::MAX_MAX_CACHE_SIZE)});
+
 namespace svector::hnsw {
 long long read_ef_search() {
   long long v = DEFAULT_EF_SEARCH;
   HNSW_EF_SEARCH.read(v);
   return v;
 }
+
+// The server writes both straight into their storage, so a read is a plain
+// load of a global rather than a per-session lookup.
+long long read_cache_mode() { return g_cache_mode; }
+
+long long read_max_cache_size() { return g_max_cache_size; }
 } // namespace svector::hnsw
 
 // Search-cost instrumentation, exposed via SHOW STATUS. Both are monotonic
@@ -921,9 +968,22 @@ long long read_ef_search() {
 // parameters -- it is the work the recall is bought with, independent of how
 // fast any one distance evaluation happens to be.
 namespace sv = vsql::preview_status_var;
-static auto HNSW_STATUS_VARS = sv::make_capability(
-    {sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
-     sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded)});
+static auto HNSW_STATUS_VARS = sv::make_capability({
+    // Search cost. distance_calls / nodes_expanded is the mean fan-out walked;
+    // distance_calls per query is the work a given recall was bought with.
+    sv::make_int("distance_calls", &svector::hnsw::hnsw_distance_calls),
+    sv::make_int("nodes_expanded", &svector::hnsw::hnsw_nodes_expanded),
+    // Vector cache. hits/(hits+misses) is the hit rate; a rising
+    // admissions_refused count means the working set does not fit the budget.
+    // cache_bytes is a gauge, the rest are monotonic.
+    sv::make_int("cache_hits", &svector::hnsw::vcache_hits),
+    sv::make_int("cache_misses", &svector::hnsw::vcache_misses),
+    sv::make_int("cache_admissions_refused",
+                 &svector::hnsw::vcache_admissions_refused),
+    sv::make_int("cache_tombstones", &svector::hnsw::vcache_tombstones),
+    sv::make_int("cache_bytes", &svector::hnsw::vcache_resident_bytes),
+    sv::make_int("cache_limit_changes", &svector::hnsw::vcache_limit_changes),
+    sv::make_int("cache_limit_slots", &svector::hnsw::vcache_limit_slots)});
 
 VEF_GENERATE_ENTRY_POINTS(
     make_extension()
@@ -932,6 +992,7 @@ VEF_GENERATE_ENTRY_POINTS(
         .with(HNSW_INDEX_CAPABILITY)
         .with(HNSW_PROFILE_CAPABILITY)
         .with(HNSW_SESSION_VARS)
+        .with(HNSW_CACHE_VARS)
         .with(HNSW_STATUS_VARS)
         .type(SVECTOR)
 

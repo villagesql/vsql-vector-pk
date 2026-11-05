@@ -97,31 +97,77 @@ IndexGraph::IndexGraph(IndexStore &store, const Index &index,
       m_ctx(make_graph_context(store, vector_buf_size, err)),
       m_dist(fetch_distance_helper_name().data(), vector_buf_size,
              IndexStore::KEY_REF_SIZE),
-      m_vectors(vector_buf_size) {}
+      m_vectors(std::max(vector_buf_size,
+                         DistanceEvaluator::max_qdata_length(
+                             vector_buf_size, IndexStore::KEY_REF_SIZE))) {}
 
 bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
   assert(vid.is_valid());
+
+  // Cached path: the entry IS the kernel's operand -- decoded, quantized, with
+  // the metric's per-vector terms folded in. Nothing to decode and nothing to
+  // copy; out points straight at it. The address is stable per vid for as long
+  // as the entry is resident, unlike the scratch buffer below.
+  if (m_vector_cache != nullptr) {
+    if (const quant::QData *q = m_vector_cache->get(vid)) {
+      out.data.data = reinterpret_cast<const unsigned char *>(q);
+      out.data.length = static_cast<uint32_t>(
+          quant::qdata_length(m_vector_cache->padded_dim()));
+      out.quantized = true;
+      return false;
+    }
+  }
 
   // The server fills the vector data into the buffer it is handed, so out
   // arrives pointing at buf, sized from the indexed column's maximum length --
   // which every stored vector fits in by construction.
   out.data.data = reinterpret_cast<const unsigned char *>(buf.data());
   out.data.length = static_cast<uint32_t>(buf.size());
-  return m_index.get_key_data(VECTOR_KEY_POS,
-                              static_cast<IndexScanKey::KeyPartRef>(vid.value),
-                              &out.data);
+  if (m_index.get_key_data(VECTOR_KEY_POS,
+                           static_cast<IndexScanKey::KeyPartRef>(vid.value),
+                           &out.data))
+    return true;
+
+  if (m_vector_cache == nullptr) return false;
+
+  // Miss on a cache-enabled index: quantize the stored floats (read in place
+  // where possible), make them resident, and hand back the quantized form --
+  // NOT the f32 bytes just fetched -- so this vector compares the same way it
+  // will on every later hit.
+  const float *floats = nullptr;
+  uint32_t dim = 0;
+  if (m_dist.stored_floats(out.data, floats, dim, m_ctx.m_error))
+    return true;
+  const quant::QData *q = m_vector_cache->insert(vid, floats);
+  if (q == nullptr) {
+    // The cache is full and refused it. Leave out.data as the encoded bytes
+    // already fetched: the comparison runs the f32 kernel against this vector,
+    // so a refusal costs the page read and nothing else. Quantizing here only
+    // to discard the result would make a full cache slower than no cache.
+    return false;
+  }
+  out.data.data = reinterpret_cast<const unsigned char *>(q);
+  out.data.length =
+      static_cast<uint32_t>(quant::qdata_length(m_vector_cache->padded_dim()));
+  out.quantized = true;
+  return false;
 }
 
 bool IndexGraph::distance(const NodeData &a, const NodeData &b,
                           DistanceType &out) {
+  // Resolved vectors already arrive in their form from resolve_node_data(),
+  // flagged by .quantized; the prepared quantized form of the query or insert
+  // vector is picked up inside m_dist when the other operand is quantized.
   // The leaf distance is a direct native-kernel call over the two operands'
   // decoded vectors, with operand a's decode reused across a traversal's
   // candidates. All of that -- the resolved kernel, the decode scratch, and the
   // fixed-operand reuse -- lives in m_dist; see distance_evaluator.h.
-  return m_dist.eval(a.data, b.data, out, m_ctx.m_error);
+  return m_dist.eval(operand(a), operand(b), a.quantized, b.quantized, out,
+                     m_ctx.m_error);
 }
 
-bool IndexGraph::decoded_vector(const Node &node, const native::Data *&out) {
+bool IndexGraph::node_vector(const Node &node,
+                             DecodedVectorCache::Entry *&out) {
   out = m_vectors.find(node.vid);
   if (out != nullptr)
     return false;
@@ -129,21 +175,36 @@ bool IndexGraph::decoded_vector(const Node &node, const native::Data *&out) {
   NodeData data;
   if (resolve_node_data(node.vid, m_ctx.m_vector_buf_1, data))
     return true;
-  const native::Data *decoded = nullptr;
-  if (m_dist.decode(data.data, m_vectors.reserve(), m_vectors.entry_size(),
-                    &decoded, m_ctx.m_error))
-    return true;
-  out = m_vectors.commit(node.vid);
-  return false;
+  if (data.quantized) {
+    // The vector cache's entry is never rewritten while the cache lives, so
+    // keep its address rather than copying it.
+    out = &m_vectors.add(
+        node.vid,
+        {nullptr, reinterpret_cast<const quant::QData *>(data.data.data)});
+    return false;
+  }
+  return m_vectors.add_stored(node.vid, data.data, nullptr, m_dist,
+                              m_ctx.m_error, &out);
+}
+
+bool IndexGraph::seed_node_vector(VID vid, const NodeData &data) {
+  // The quantized form prepare_external_operand() made, if a vector cache is
+  // attached. It sits in m_ctx.m_query_qbuf, written once per IndexGraph, so
+  // it stays valid for as long as m_vectors does. create_node() runs once per
+  // level of the insert; add_stored() keeps the first call's entry.
+  const quant::QData *q =
+      data.has_qdata ? reinterpret_cast<const quant::QData *>(data.qdata.data)
+                     : nullptr;
+  return m_vectors.add_stored(vid, data.data, q, m_dist, m_ctx.m_error);
 }
 
 bool IndexGraph::distance(const Node &a, const Node &b, DistanceType &out) {
-  // Both pointers stay valid together: entries in m_vectors never move.
-  const native::Data *a_vec = nullptr;
-  const native::Data *b_vec = nullptr;
-  if (decoded_vector(a, a_vec) || decoded_vector(b, b_vec))
+  // Both entries stay valid together: entries in m_vectors never move.
+  DecodedVectorCache::Entry *a_vec = nullptr;
+  DecodedVectorCache::Entry *b_vec = nullptr;
+  if (node_vector(a, a_vec) || node_vector(b, b_vec))
     return true;
-  return m_dist.eval(a_vec, b_vec, out, m_ctx.m_error);
+  return m_vectors.distance(*a_vec, *b_vec, m_dist, out, m_ctx.m_error);
 }
 
 bool IndexGraph::distance(const NodeData &a, const Node &b, DistanceType &out) {
@@ -325,6 +386,8 @@ bool IndexGraph::create_node(const std::optional<Node> &parent, LevelId level,
   // never touches storage.
   IndexScanKey::KeyPartRef owner_ref;
   if (m_index.get_key_ref(VECTOR_KEY_POS, data.data, &owner_ref))
+    return true;
+  if (seed_node_vector(VID{owner_ref}, data))
     return true;
 
   // ~MtrCtx() commits, and commit() is idempotent, so an early return below
