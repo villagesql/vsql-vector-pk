@@ -31,28 +31,9 @@
 #include <variant>
 #include <vector>
 
+#include "stats.h"
+
 namespace svector::hnsw {
-
-// Instrumentation: process-wide counts of distance evaluations and of
-// evaluate_distances() batches (one per expanded node or seed). Exposed as
-// the vsql_vector_distance_calls / vsql_vector_nodes_expanded status
-// variables, so a workload's search cost can be compared across index
-// parameters. Relaxed ordering: these are monotonic counters read between
-// workloads, never used to make a decision inside the index, so a lost
-// update under contention costs a little accuracy and nothing else.
-// Plain long long rather than std::atomic<long long>, because the status
-// variable capability registers a long long* that the server reads directly.
-// Updated with relaxed atomic builtins so concurrent searches do not tear
-// them; the server's read is an ordinary load, which is fine for a counter
-// sampled between workloads.
-inline long long hnsw_distance_calls = 0;
-inline long long hnsw_nodes_expanded = 0;
-
-inline void hnsw_count_distances(size_t n) {
-  __atomic_fetch_add(&hnsw_distance_calls, static_cast<long long>(n),
-                     __ATOMIC_RELAXED);
-  __atomic_fetch_add(&hnsw_nodes_expanded, 1, __ATOMIC_RELAXED);
-}
 
 namespace detail {
 
