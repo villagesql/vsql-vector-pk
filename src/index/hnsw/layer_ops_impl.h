@@ -319,7 +319,29 @@ template <typename Graph, template <typename> class Policy>
 template <typename Query>
 bool LayerOperations<Graph, Policy>::evaluate_distances_with(
     const Query &query, std::vector<Candidate> &candidates, size_t begin) {
+  // Every candidate is known before the first distance, so a Graph that can
+  // prefetch is asked to, in two stages: first the lookup of every candidate
+  // at once, so those misses overlap; then, PREFETCH_AHEAD candidates ahead of
+  // the one being computed, its vector, so it arrives while the kernel works.
+  constexpr bool prefetching = requires(Graph &g, const Node &n) {
+    g.prefetch_lookup(n);
+    g.prefetch_vector(n);
+  };
+  if constexpr (prefetching) {
+    for (size_t i = begin; i < candidates.size(); ++i) {
+      m_graph.prefetch_lookup(candidates[i].node);
+    }
+    for (size_t i = begin;
+         i < candidates.size() && i < begin + PREFETCH_AHEAD; ++i) {
+      m_graph.prefetch_vector(candidates[i].node);
+    }
+  }
   for (size_t i = begin; i < candidates.size(); ++i) {
+    if constexpr (prefetching) {
+      if (i + PREFETCH_AHEAD < candidates.size()) {
+        m_graph.prefetch_vector(candidates[i + PREFETCH_AHEAD].node);
+      }
+    }
     Candidate &candidate = candidates[i];
     if (m_graph.distance(query, candidate.node, candidate.distance)) {
       return true;
