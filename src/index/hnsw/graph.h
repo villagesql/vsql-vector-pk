@@ -519,9 +519,9 @@ private:
 public:
   // Attach a vector cache to sit behind resolve_node_data(), or nullptr for
   // the uncached paged path. Refused when this index's metric has no
-  // quantized kernel -- the cache stores a quantized form, so attaching one
-  // on, say, a cosine index would be a correctness bug rather than a slow
-  // path. Such an index simply runs as it does today. Not owned: the cache
+  // quantized kernel (L1) -- the cache stores a quantized form, so attaching
+  // one there would be a correctness bug rather than a slow path. Such an
+  // index simply runs as it does today. Not owned: the cache
   // lives on the IndexStore and outlives any one IndexGraph, which is what
   // lets it persist across queries.
   void set_vector_cache(VectorCache *cache) {

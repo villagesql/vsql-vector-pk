@@ -1,0 +1,81 @@
+# The vector cache on cosine and inner-product indexes.
+#
+# The cache holds vectors in int16 form, so it attaches only to an index whose
+# metric has an int16 kernel. Each check below runs a KNN query with the cache
+# on and confirms that:
+#   - the query was served from the cache (cache_hits rose), and
+#   - its top 10 matches brute force in f32.
+#
+# The vectors vary in magnitude as well as direction, since magnitude is what
+# separates inner product from cosine.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+SET @saved_cache_mode = @@GLOBAL.vsql_vector.cache_mode;
+SET GLOBAL vsql_vector.cache_mode = 1;
+
+CREATE TABLE tc (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_cosine) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+CREATE TABLE ti (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_inner_product) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+# Each vector is passed to FROM_STRING as a literal: a computed string argument
+# leaves the dimension unknown and the insert into SVECTOR(4) fails to decode.
+--disable_query_log
+--let $i = 1
+while ($i <= 200)
+{
+  --let $vec = `SELECT CONCAT('[', ROUND(SIN($i) * (1 + $i % 7), 4), ', ', ROUND(COS($i * 1.7) * (1 + $i % 5), 4), ', ', ROUND(SIN($i * 0.3) * (1 + $i % 3), 4), ', ', ROUND(COS($i * 2.3), 4), ']')`
+  --eval INSERT INTO tc VALUES ($i, SVECTOR::FROM_STRING('$vec'))
+  --eval INSERT INTO ti VALUES ($i, SVECTOR::FROM_STRING('$vec'))
+  --inc $i
+}
+--enable_query_log
+
+--let $q = '[1, 0.5, -0.3, 0.2]'
+
+--echo #
+--echo # 1. Cosine.
+--echo #
+--eval EXPLAIN FORMAT=TREE SELECT id FROM tc ORDER BY COSINE_DISTANCE(v, $q) LIMIT 10
+
+SELECT VARIABLE_VALUE INTO @hits0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_hits';
+--echo # Through the index:
+--eval SELECT id, ROUND(COSINE_DISTANCE(v, $q), 4) AS d FROM tc ORDER BY COSINE_DISTANCE(v, $q) LIMIT 10
+SELECT VARIABLE_VALUE INTO @hits1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_hits';
+SELECT @hits1 - @hits0 > 0 AS served_from_cache;
+
+--echo # Brute force (primary key scan and sort):
+--eval SELECT id, ROUND(COSINE_DISTANCE(v, $q), 4) AS d FROM tc FORCE INDEX (PRIMARY) ORDER BY COSINE_DISTANCE(v, $q) LIMIT 10
+
+--echo #
+--echo # 2. Inner product.
+--echo #
+--eval EXPLAIN FORMAT=TREE SELECT id FROM ti ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+
+SELECT VARIABLE_VALUE INTO @hits0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_hits';
+--echo # Through the index:
+--eval SELECT id, ROUND(INNER_PRODUCT(v, $q), 4) AS ip FROM ti ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+SELECT VARIABLE_VALUE INTO @hits1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_hits';
+SELECT @hits1 - @hits0 > 0 AS served_from_cache;
+
+--echo # Brute force (primary key scan and sort):
+--eval SELECT id, ROUND(INNER_PRODUCT(v, $q), 4) AS ip FROM ti FORCE INDEX (PRIMARY) ORDER BY NEGATIVE_INNER_PRODUCT(v, $q) LIMIT 10
+
+DROP TABLE tc, ti;
+SET GLOBAL vsql_vector.cache_mode = @saved_cache_mode;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
