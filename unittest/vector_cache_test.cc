@@ -341,6 +341,27 @@ void test_two_refused_operands_do_not_share_a_buffer() {
   assert(got > 1.0 && "distance collapsed to zero: operands shared a buffer");
 }
 
+// cache_bytes is a gauge over every live cache, so a cache that goes away
+// must take its entries with it. Dropping an index destroys its cache; if the
+// gauge kept those bytes, the next index built on the server would read as
+// using both caches' memory.
+void test_destroyed_cache_leaves_resident_bytes() {
+  const long long before = svector::hnsw::vcache_resident_bytes;
+  {
+    VectorCache c = make_cache(4);
+    const std::vector<float> a = vec(1), b = vec(2), d = vec(3);
+    c.insert(vid(10), a.data());
+    c.insert(vid(11), b.data());
+    c.insert(vid(12), d.data());
+    // One retired entry: the gauge already dropped it, so destruction must
+    // subtract only what is still resident.
+    c.invalidate(vid(11));
+    assert(svector::hnsw::vcache_resident_bytes ==
+           before + static_cast<long long>(c.resident_bytes()));
+  }
+  assert(svector::hnsw::vcache_resident_bytes == before);
+}
+
 // Whether the OS has backed the page holding addr with memory.
 bool page_resident(const void *addr) {
   const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
@@ -390,6 +411,7 @@ int main() {
   test_all_operand_combinations_agree();
   test_two_refused_operands_do_not_share_a_buffer();
   test_budget_is_committed_only_as_filled();
+  test_destroyed_cache_leaves_resident_bytes();
   std::printf("All vector cache tests passed.\n");
   return 0;
 }

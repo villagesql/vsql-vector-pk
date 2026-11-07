@@ -138,6 +138,11 @@ public:
   // fixed for the cache's lifetime rather than carried per entry.
   VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim);
 
+  // Takes its resident entries off the cache_bytes gauge, which counts every
+  // live cache. The SDK destroys an index's store, and with it this cache,
+  // after the index is dropped.
+  ~VectorCache();
+
   // Look up vid. Returns the resident QData, or nullptr on a miss.
   const quant::QData *get(VID vid);
 
