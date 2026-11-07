@@ -46,6 +46,9 @@
 #include <cstring>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "../src/index/hnsw/vector_cache.h"
 
 namespace {
@@ -338,6 +341,42 @@ void test_two_refused_operands_do_not_share_a_buffer() {
   assert(got > 1.0 && "distance collapsed to zero: operands shared a buffer");
 }
 
+// Whether the OS has backed the page holding addr with memory.
+bool page_resident(const void *addr) {
+  const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  auto *start = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(addr) &
+                                         ~(page - 1));
+  unsigned char state = 0;
+#if defined(__APPLE__)
+  const int rc = mincore(static_cast<caddr_t>(start), page,
+                         reinterpret_cast<char *>(&state));
+#else
+  const int rc = mincore(start, page, &state);
+#endif
+  assert(rc == 0);
+  return (state & 1) != 0;
+}
+
+// A budget is reserved, not committed: building a cache far larger than what
+// it holds must not back the whole slab with memory up front. Pages the fills
+// never reached stay non-resident; the page holding the first entry is.
+void test_budget_is_committed_only_as_filled() {
+  const uint32_t padded = svector::quant::qvector_padded_dim(kDim);
+  const size_t entry_bytes = svector::quant::qdata_length(padded);
+  const size_t budget = size_t{256} * 1024 * 1024;
+  VectorCache c(budget, kDim, padded);
+  const std::vector<float> a = vec(1);
+  const svector::quant::QData *first = c.insert(vid(10), a.data());
+  assert(first != nullptr);
+  assert(page_resident(first));
+
+  // Slot 0 starts the slab; the last slot the budget allows ends it.
+  const auto *base = reinterpret_cast<const unsigned char *>(first);
+  const size_t slots = budget / entry_bytes;
+  const unsigned char *last = base + (slots - 1) * entry_bytes;
+  assert(!page_resident(last));
+}
+
 } // namespace
 
 int main() {
@@ -350,6 +389,7 @@ int main() {
   test_peek_and_prefetch_do_not_count();
   test_all_operand_combinations_agree();
   test_two_refused_operands_do_not_share_a_buffer();
+  test_budget_is_committed_only_as_filled();
   std::printf("All vector cache tests passed.\n");
   return 0;
 }

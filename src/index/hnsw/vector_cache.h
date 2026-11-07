@@ -122,6 +122,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "../../quantize.h"
@@ -191,12 +192,17 @@ public:
   size_t entries() const { return m_live.load(std::memory_order_relaxed); }
 
 private:
-  // SLOT STORAGE. One slab, allocated once at capacity, entries at fixed
-  // stride -- so a slot's address never moves and the lifetime contract above
-  // holds by construction rather than by a container's guarantees. One
-  // allocation for the whole cache, and a QData is reached by indexing rather
-  // than by chasing a pointer.
-  std::vector<unsigned char> m_slab;
+  // SLOT STORAGE. One slab, mapped once at capacity, entries at fixed stride,
+  // so a slot's address never moves and the lifetime contract above holds
+  // by construction rather than by a container's guarantees. One mapping for
+  // the whole cache, and a QData is reached by indexing rather than by chasing
+  // a pointer. The mapping reserves the budget; the OS commits each page only
+  // when a fill first writes to it (see the constructor).
+  struct SlabUnmap {
+    size_t bytes;
+    void operator()(unsigned char *p) const;
+  };
+  std::unique_ptr<unsigned char, SlabUnmap> m_slab;
   // Slots the slab was BUILT to hold. Fixed for the cache's life: the slab is
   // never reallocated, because that would move every entry and invalidate the
   // pointers callers hold.
@@ -215,7 +221,7 @@ private:
   std::atomic<uint32_t> m_used{0};
 
   quant::QData *slot_data(uint32_t slot) {
-    return reinterpret_cast<quant::QData *>(m_slab.data() +
+    return reinterpret_cast<quant::QData *>(m_slab.get() +
                                             size_t{slot} * m_entry_bytes);
   }
 
