@@ -83,6 +83,12 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
   m_index_mask = buckets - 1;
 }
 
+VectorCache::~VectorCache() {
+  // Retired entries already left the gauge in invalidate(), so only what is
+  // still resident comes off here.
+  stat_add(vcache_resident_bytes, -static_cast<long long>(resident_bytes()));
+}
+
 void VectorCache::SlabUnmap::operator()(unsigned char *p) const {
   munmap(p, bytes);
 }
