@@ -2,12 +2,11 @@
 # entries.
 #
 # An insert compares its new node against neighbours whose lists it overflows
-# (shrink_neighbours). If that comparison fetched the new node back by VID, the
-# vector cache would admit it, and the invalidate at the end of insert() would
-# then retire the entry it had just admitted: one dead slot per insert, which a
-# fill-once cache never reclaims. create_node() instead seeds the insert's
-# per-call vectors with the new node, so nothing is admitted during its own
-# insert and the invalidate finds nothing live.
+# (shrink_neighbours). create_node() seeds the insert's per-call vectors with
+# the new node, so those comparisons never fetch it back by VID, and its
+# VID-reuse invalidate runs before anything can reach the node. An invalidate
+# that ran after the node was linked would retire an entry admitted for it:
+# one dead slot per insert, which a fill-once cache never reclaims.
 #
 # M = 2 keeps neighbour lists short, so nearly every insert after the first few
 # overflows some neighbour and takes the shrink path. The vectors are distinct
