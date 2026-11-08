@@ -387,6 +387,15 @@ bool IndexGraph::create_node(const std::optional<Node> &parent, LevelId level,
   IndexScanKey::KeyPartRef owner_ref;
   if (m_index.get_key_ref(VECTOR_KEY_POS, data.data, &owner_ref))
     return true;
+  // A reused VID may still have the previous occupant's vector in the cache:
+  // purge() invalidates on the way out, but a VID freed in a session that
+  // never ran a purge through this cache, or freed before the cache existed,
+  // would otherwise serve the old vector. Drop it here, at the first level
+  // created, while nothing links to the new node: once link_neighbours() adds
+  // the back-edges, a concurrent insert can reach the node and admit its
+  // vector, and that entry is correct and must stay. The insert itself never
+  // admits its own VID, because the seed below serves its comparisons.
+  if (!parent) m_store.invalidate_vector_cache(VID{owner_ref});
   if (seed_node_vector(VID{owner_ref}, data))
     return true;
 
