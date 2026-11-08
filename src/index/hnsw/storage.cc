@@ -1034,15 +1034,6 @@ bool insert(StorageCtx *ctx, const Index &index, Segment::TrxRef trx_ref,
   if (GraphOperations<IndexGraph>(graph).insert(node_data, top_node))
     return true;
 
-  // Belt and braces against a reused VID: purge() invalidates on the way out,
-  // but a VID freed in a session that never ran a purge through this cache --
-  // or freed before the cache existed -- would otherwise serve the previous
-  // occupant's vector. Dropping the entry for a VID we have just written costs
-  // one hash erase per insert. Only a stale entry can be found here: the insert
-  // itself never admits its own VID, because create_node() seeds the graph's
-  // per-call vectors with it (IndexGraph::seed_node_vector()).
-  ctx->user()->invalidate_vector_cache(top_node.vid);
-
   *key_ref = static_cast<IndexScanKey::KeyPartRef>(top_node.nid.value);
   return false;
 }
