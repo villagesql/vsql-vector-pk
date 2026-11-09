@@ -46,6 +46,9 @@
 #include <cstring>
 #include <vector>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "../src/index/hnsw/vector_cache.h"
 
 namespace {
@@ -355,6 +358,63 @@ void test_two_refused_operands_do_not_share_a_buffer() {
   assert(got > 1.0 && "distance collapsed to zero: operands shared a buffer");
 }
 
+// cache_bytes is a gauge over every live cache, so a cache that goes away
+// must take its entries with it. Dropping an index destroys its cache; if the
+// gauge kept those bytes, the next index built on the server would read as
+// using both caches' memory.
+void test_destroyed_cache_leaves_resident_bytes() {
+  const long long before = svector::hnsw::vcache_resident_bytes;
+  {
+    VectorCache c = make_cache(4);
+    const std::vector<float> a = vec(1), b = vec(2), d = vec(3);
+    c.insert(vid(10), a.data());
+    c.insert(vid(11), b.data());
+    c.insert(vid(12), d.data());
+    // One retired entry: the gauge already dropped it, so destruction must
+    // subtract only what is still resident.
+    c.invalidate(vid(11));
+    assert(svector::hnsw::vcache_resident_bytes ==
+           before + static_cast<long long>(c.resident_bytes()));
+  }
+  assert(svector::hnsw::vcache_resident_bytes == before);
+}
+
+// Whether the OS has backed the page holding addr with memory.
+bool page_resident(const void *addr) {
+  const auto page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  auto *start = reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(addr) &
+                                         ~(page - 1));
+  unsigned char state = 0;
+#if defined(__APPLE__)
+  const int rc = mincore(static_cast<caddr_t>(start), page,
+                         reinterpret_cast<char *>(&state));
+#else
+  const int rc = mincore(start, page, &state);
+#endif
+  assert(rc == 0);
+  return (state & 1) != 0;
+}
+
+// A budget is reserved, not committed: building a cache far larger than what
+// it holds must not back the whole slab with memory up front. Pages the fills
+// never reached stay non-resident; the page holding the first entry is.
+void test_budget_is_committed_only_as_filled() {
+  const uint32_t padded = svector::quant::qvector_padded_dim(kDim);
+  const size_t entry_bytes = svector::quant::qdata_length(padded);
+  const size_t budget = size_t{256} * 1024 * 1024;
+  VectorCache c(budget, kDim, padded);
+  const std::vector<float> a = vec(1);
+  const svector::quant::QData *first = c.insert(vid(10), a.data());
+  assert(first != nullptr);
+  assert(page_resident(first));
+
+  // Slot 0 starts the slab; the last slot the budget allows ends it.
+  const auto *base = reinterpret_cast<const unsigned char *>(first);
+  const size_t slots = budget / entry_bytes;
+  const unsigned char *last = base + (slots - 1) * entry_bytes;
+  assert(!page_resident(last));
+}
+
 } // namespace
 
 int main() {
@@ -368,6 +428,8 @@ int main() {
   test_count_hit_counts_a_peeked_entry();
   test_all_operand_combinations_agree();
   test_two_refused_operands_do_not_share_a_buffer();
+  test_budget_is_committed_only_as_filled();
+  test_destroyed_cache_leaves_resident_bytes();
   std::printf("All vector cache tests passed.\n");
   return 0;
 }

@@ -1,0 +1,90 @@
+# Concurrent inserts into an HNSW index with the vector cache on must not
+# retire cache entries.
+#
+# An insert links its new node into the graph (link_neighbours) before it
+# returns, so another connection's insert can reach that node and admit its
+# vector to the cache while the first insert is still running. If insert()
+# then invalidates its own VID on the way out, it retires an entry that holds
+# the right vector, and a later read fills it again: a tombstone and an extra
+# miss for every node reached in that window.
+#
+# Three connections each insert a third of the rows in one multi-row
+# statement, so their inserts overlap for the whole run. The race is timing
+# dependent: a broken build shows tombstones on most runs, not on every run.
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+SET @saved_cache_mode = @@GLOBAL.vsql_vector.cache_mode;
+SET GLOBAL vsql_vector.cache_mode = 1;
+
+# The vectors are staged first, so each connection's insert is one INSERT ...
+# SELECT that runs its rows back to back rather than waiting on the client.
+CREATE TABLE staging (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v  SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 32)
+) ENGINE=InnoDB;
+
+# Each vector is passed to FROM_STRING as a literal: a computed string argument
+# leaves the dimension unknown and the insert into SVECTOR(4) fails to decode.
+--disable_query_log
+--let $i = 1
+while ($i <= 3000)
+{
+  --let $vec = `SELECT CONCAT('[', SIN($i), ', ', COS($i), ', ', SIN($i * 0.7), ', ', COS($i * 1.3), ']')`
+  --eval INSERT INTO staging VALUES ($i, SVECTOR::FROM_STRING('$vec'))
+  --inc $i
+}
+--enable_query_log
+
+# A first batch gives the graph some size, so the concurrent inserts below
+# search and link into an existing graph from their first row.
+INSERT INTO t SELECT id, v FROM staging WHERE id <= 300;
+
+SELECT VARIABLE_VALUE INTO @tomb0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+
+--connect (con1, localhost, root,,)
+--connect (con2, localhost, root,,)
+--connect (con3, localhost, root,,)
+
+--connection con1
+--send INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 0
+--connection con2
+--send INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 1
+--connection con3
+--send INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 2
+
+--connection con1
+--reap
+--connection con2
+--reap
+--connection con3
+--reap
+
+--connection default
+--disconnect con1
+--disconnect con2
+--disconnect con3
+
+SELECT VARIABLE_VALUE INTO @tomb1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+
+SELECT COUNT(*) AS rows_inserted FROM t;
+
+--echo # No entry was retired: a node another insert admitted while its own
+--echo # insert was still running holds the right vector and stays resident.
+SELECT @tomb1 - @tomb0 AS tombstones;
+
+DROP TABLE t;
+DROP TABLE staging;
+SET GLOBAL vsql_vector.cache_mode = @saved_cache_mode;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;
