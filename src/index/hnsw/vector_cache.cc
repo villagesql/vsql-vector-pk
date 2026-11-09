@@ -125,6 +125,15 @@ const quant::QData *VectorCache::get(VID vid) {
   return slot_data(b->slot);
 }
 
+void VectorCache::count_hit() const { stat_add(vcache_hits, 1); }
+
+const quant::QData *VectorCache::peek(VID vid) {
+  if (m_capacity == 0) return nullptr;
+  Bucket *b = probe(vid.value);
+  if (b->vid.load(std::memory_order_acquire) != vid.value) return nullptr;
+  return slot_data(b->slot);
+}
+
 
 const quant::QData *VectorCache::insert(VID vid, const float *src) {
   // Budget below one entry: nothing can ever become resident, so every insert

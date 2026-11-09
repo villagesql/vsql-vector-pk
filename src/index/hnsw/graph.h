@@ -322,6 +322,24 @@ public:
 
   bool distance(const NodeData &a, const Node &b, DistanceType &out);
 
+  // Prefetch hooks for LayerOperations' distance loop, which knows every
+  // candidate of a batch before computing the first distance. Each starts a
+  // memory load early so the misses of a batch overlap: prefetch_lookup()
+  // node's vector cache bucket, prefetch_vector() node's cached vector itself.
+  // No-ops without a vector cache, and for a vector it does not hold.
+  // prefetch_vector() also keeps the entry it found, so the distance that
+  // follows uses it instead of finding it again.
+  void prefetch_lookup(const Node &node) {
+    if (m_vector_cache != nullptr) m_vector_cache->prefetch_bucket(node.vid);
+  }
+  void prefetch_vector(const Node &node) {
+    if (m_vector_cache == nullptr) return;
+    if (const quant::QData *q = m_vector_cache->peek(node.vid)) {
+      m_vector_cache->prefetch_entry(q);
+      m_peeked[m_peeked_next++ % m_peeked.size()] = {node.vid, q};
+    }
+  }
+
   // level is node's own level. Callers always already know it (it's how
   // they located node in the first place), so it's taken directly instead
   // of rediscovering it with a locate() call.
@@ -561,6 +579,28 @@ public:
 
 private:
   VectorCache *m_vector_cache = nullptr;
+
+  // Takes vid's entry from the ones prefetch_vector() kept, or returns
+  // nullptr if it kept none for vid.
+  const quant::QData *take_peeked(VID vid) {
+    for (Peeked &p : m_peeked) {
+      if (p.vid == vid) {
+        p.vid = VID{};
+        return p.q;
+      }
+    }
+    return nullptr;
+  }
+
+  // The entries prefetch_vector() found most recently. A distance is computed
+  // at most LayerOperations' PREFETCH_AHEAD candidates after its prefetch, so
+  // the slots must outnumber that.
+  struct Peeked {
+    VID vid;
+    const quant::QData *q = nullptr;
+  };
+  std::array<Peeked, 4> m_peeked{};
+  size_t m_peeked_next = 0;
 
   // One link in a node's overflow chain: the overflow entry to drop (nid),
   // and the record whose Overflow field currently points to it (prev, of
