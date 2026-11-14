@@ -88,6 +88,31 @@ reprepares
 0
 DEALLOCATE PREPARE s;
 #
+# HNSW index, vector bound from a hex literal: prepared once
+#
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = 0x0000803F000000400000404000008040;
+EXECUTE s USING @q;
+id
+1
+5
+3
+SET @q = X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+id
+4
+3
+5
+SET @q = 0x0000804000004040000000400000803F;
+EXECUTE s USING @q;
+id
+2
+5
+1
+reprepares
+0
+DEALLOCATE PREPARE s;
+#
 # The index serves the query with the vector as a ?: a custom index
 # distance scan, no Sort, at every EXECUTE
 #

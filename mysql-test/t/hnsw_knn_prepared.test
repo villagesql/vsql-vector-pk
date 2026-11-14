@@ -10,7 +10,8 @@
 #
 # Each case prints how many times the statement was prepared again over its
 # EXECUTEs (Com_stmt_reprepare), with the vector bound as text and in the
-# binary form, on a table with and without the index. A prepared EXPLAIN shows
+# binary form (a _binary or a hex literal), on a table with and without the
+# index. A prepared EXPLAIN shows
 # the index is still used when the vector is a ?.
 
 --source include/no_ps_protocol.inc
@@ -83,6 +84,27 @@ SET @q = _binary X'00001041000010410000104100001041';
 EXECUTE s USING @q;
 # [4,3,2,1]
 SET @q = _binary X'0000804000004040000000400000803F';
+EXECUTE s USING @q;
+--let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+--disable_query_log
+--eval SELECT $after - $before AS reprepares
+--enable_query_log
+DEALLOCATE PREPARE s;
+
+--echo #
+--echo # HNSW index, vector bound from a hex literal: prepared once
+--echo #
+
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+--let $before = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+# [1,2,3,4]
+SET @q = 0x0000803F000000400000404000008040;
+EXECUTE s USING @q;
+# [9,9,9,9]
+SET @q = X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+# [4,3,2,1]
+SET @q = 0x0000804000004040000000400000803F;
 EXECUTE s USING @q;
 --let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
 --disable_query_log
