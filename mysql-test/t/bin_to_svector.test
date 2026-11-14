@@ -23,8 +23,8 @@ CREATE TABLE t (
   v  SVECTOR(4) NOT NULL
 ) ENGINE=InnoDB;
 
-# _binary is required: a bare X'..' literal is not yet read as the binary
-# form.
+# A hex or bit literal without _binary is the binary form too; hex_to_svector
+# covers it.
 INSERT INTO t VALUES (1, _binary X'0000803F000000400000404000008040');
 INSERT INTO t VALUES (2, '[1.0, 2.0, 3.0, 4.0]');
 

@@ -143,8 +143,9 @@ INSERT INTO embeddings VALUES (5, '[9.0, 8.0, 7.0, 6.0]', NULL);  -- L1 dist fro
 Both arguments to a distance/similarity function must have the same dimension. All functions return NULL if either argument is NULL.
 
 A vector can also be given in binary form: a value in the binary charset (a
-`_binary` literal, a binary prepared-statement parameter, a `VARBINARY` column)
-is read as its little-endian float32 elements with no header, which is what
+`_binary` literal, a hex literal such as `0x...` or `X'...'`, a bit literal, a
+binary prepared-statement parameter, a `VARBINARY` column) is read as its
+little-endian float32 elements with no header, which is what
 `numpy.asarray(v, '<f4').tobytes()` produces. This is much cheaper for a client
 to build than a decimal literal:
 
