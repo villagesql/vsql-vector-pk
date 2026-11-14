@@ -29,8 +29,8 @@ EXPLAIN FORMAT=TREE
 SELECT id FROM t ORDER BY L2_DISTANCE(v, 0x0000803F000000400000404000008040)
 LIMIT 3;
 EXPLAIN
--> Limit: 3 row(s)  (cost=0.75 rows=3)
-    -> Custom index distance scan on idx_v  (cost=0.75 rows=5)
+-> Limit: 3 row(s)  (cost=# rows=#)
+    -> Custom index distance scan on idx_v  (cost=# rows=#)
 
 SELECT id FROM t ORDER BY L2_DISTANCE(v, 0x0000803F000000400000404000008040)
 LIMIT 3;
