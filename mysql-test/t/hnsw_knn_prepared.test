@@ -1,0 +1,134 @@
+# A prepared nearest-neighbour query with the query vector as a ?:
+#
+#   SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT k
+#
+# is prepared once and served by the HNSW index at every EXECUTE.
+# L2_DISTANCE has no prerun, postrun or bind_and_check_types hook, and the ?
+# takes its SVECTOR(4) type from v, so nothing about the call depends on the
+# value bound: the server has no reason to prepare the statement again at each
+# EXECUTE.
+#
+# Each case prints how many times the statement was prepared again over its
+# EXECUTEs (Com_stmt_reprepare), with the vector bound as text and in the
+# binary form (a _binary or a hex literal), on a table with and without the
+# index. A prepared EXPLAIN shows
+# the index is still used when the vector is a ?.
+
+--source include/no_ps_protocol.inc
+
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+
+CREATE TABLE t (
+  id INT PRIMARY KEY,
+  v SVECTOR(4) NOT NULL,
+  INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+
+CREATE TABLE t_noidx (
+  id INT PRIMARY KEY,
+  v SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+
+INSERT INTO t VALUES (1, '[1,2,3,4]'), (2, '[4,3,2,1]'), (3, '[1,2,3,6]'),
+                     (4, '[9,9,9,9]'), (5, '[2,2,3,4]');
+INSERT INTO t_noidx SELECT * FROM t;
+
+--echo #
+--echo # No index, vector bound as text: prepared once
+--echo #
+
+PREPARE s FROM 'SELECT id FROM t_noidx ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+--let $before = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+SET @q = '[1,2,3,4]';
+EXECUTE s USING @q;
+SET @q = '[9,9,9,9]';
+EXECUTE s USING @q;
+SET @q = '[4,3,2,1]';
+EXECUTE s USING @q;
+--let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+--disable_query_log
+--eval SELECT $after - $before AS reprepares
+--enable_query_log
+DEALLOCATE PREPARE s;
+
+--echo #
+--echo # HNSW index, vector bound as text: prepared once
+--echo #
+
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+--let $before = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+SET @q = '[1,2,3,4]';
+EXECUTE s USING @q;
+SET @q = '[9,9,9,9]';
+EXECUTE s USING @q;
+SET @q = '[4,3,2,1]';
+EXECUTE s USING @q;
+--let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+--disable_query_log
+--eval SELECT $after - $before AS reprepares
+--enable_query_log
+DEALLOCATE PREPARE s;
+
+--echo #
+--echo # HNSW index, vector bound in the binary form (packed f32): prepared once
+--echo #
+
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+--let $before = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+# [1,2,3,4]
+SET @q = _binary X'0000803F000000400000404000008040';
+EXECUTE s USING @q;
+# [9,9,9,9]
+SET @q = _binary X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+# [4,3,2,1]
+SET @q = _binary X'0000804000004040000000400000803F';
+EXECUTE s USING @q;
+--let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+--disable_query_log
+--eval SELECT $after - $before AS reprepares
+--enable_query_log
+DEALLOCATE PREPARE s;
+
+--echo #
+--echo # HNSW index, vector bound from a hex literal: prepared once
+--echo #
+
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+--let $before = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+# [1,2,3,4]
+SET @q = 0x0000803F000000400000404000008040;
+EXECUTE s USING @q;
+# [9,9,9,9]
+SET @q = X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+# [4,3,2,1]
+SET @q = 0x0000804000004040000000400000803F;
+EXECUTE s USING @q;
+--let $after = query_get_value(SHOW SESSION STATUS LIKE 'Com_stmt_reprepare', Value, 1)
+--disable_query_log
+--eval SELECT $after - $before AS reprepares
+--enable_query_log
+DEALLOCATE PREPARE s;
+
+--echo #
+--echo # The index serves the query with the vector as a ?: a custom index
+--echo # distance scan, no Sort, at every EXECUTE
+--echo #
+
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = '[1,2,3,4]';
+--replace_regex /\(cost=[0-9.e+]+ rows=[0-9.e+]+\)/(cost=# rows=#)/
+EXECUTE s USING @q;
+SET @q = '[9,9,9,9]';
+--replace_regex /\(cost=[0-9.e+]+ rows=[0-9.e+]+\)/(cost=# rows=#)/
+EXECUTE s USING @q;
+DEALLOCATE PREPARE s;
+
+SET @q = NULL;
+DROP TABLE t;
+DROP TABLE t_noidx;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

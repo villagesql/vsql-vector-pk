@@ -1,0 +1,138 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+v SVECTOR(4) NOT NULL,
+INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 64)
+) ENGINE=InnoDB;
+CREATE TABLE t_noidx (
+id INT PRIMARY KEY,
+v SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+INSERT INTO t VALUES (1, '[1,2,3,4]'), (2, '[4,3,2,1]'), (3, '[1,2,3,6]'),
+(4, '[9,9,9,9]'), (5, '[2,2,3,4]');
+INSERT INTO t_noidx SELECT * FROM t;
+#
+# No index, vector bound as text: prepared once
+#
+PREPARE s FROM 'SELECT id FROM t_noidx ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = '[1,2,3,4]';
+EXECUTE s USING @q;
+id
+1
+5
+3
+SET @q = '[9,9,9,9]';
+EXECUTE s USING @q;
+id
+4
+3
+5
+SET @q = '[4,3,2,1]';
+EXECUTE s USING @q;
+id
+2
+5
+1
+reprepares
+0
+DEALLOCATE PREPARE s;
+#
+# HNSW index, vector bound as text: prepared once
+#
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = '[1,2,3,4]';
+EXECUTE s USING @q;
+id
+1
+5
+3
+SET @q = '[9,9,9,9]';
+EXECUTE s USING @q;
+id
+4
+3
+5
+SET @q = '[4,3,2,1]';
+EXECUTE s USING @q;
+id
+2
+5
+1
+reprepares
+0
+DEALLOCATE PREPARE s;
+#
+# HNSW index, vector bound in the binary form (packed f32): prepared once
+#
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = _binary X'0000803F000000400000404000008040';
+EXECUTE s USING @q;
+id
+1
+5
+3
+SET @q = _binary X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+id
+4
+3
+5
+SET @q = _binary X'0000804000004040000000400000803F';
+EXECUTE s USING @q;
+id
+2
+5
+1
+reprepares
+0
+DEALLOCATE PREPARE s;
+#
+# HNSW index, vector bound from a hex literal: prepared once
+#
+PREPARE s FROM 'SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = 0x0000803F000000400000404000008040;
+EXECUTE s USING @q;
+id
+1
+5
+3
+SET @q = X'00001041000010410000104100001041';
+EXECUTE s USING @q;
+id
+4
+3
+5
+SET @q = 0x0000804000004040000000400000803F;
+EXECUTE s USING @q;
+id
+2
+5
+1
+reprepares
+0
+DEALLOCATE PREPARE s;
+#
+# The index serves the query with the vector as a ?: a custom index
+# distance scan, no Sort, at every EXECUTE
+#
+PREPARE s FROM 'EXPLAIN FORMAT=TREE SELECT id FROM t ORDER BY L2_DISTANCE(v, ?) LIMIT 3';
+SET @q = '[1,2,3,4]';
+EXECUTE s USING @q;
+EXPLAIN
+-> Limit: 3 row(s)  (cost=# rows=#)
+    -> Custom index distance scan on idx_v  (cost=# rows=#)
+
+SET @q = '[9,9,9,9]';
+EXECUTE s USING @q;
+EXPLAIN
+-> Limit: 3 row(s)  (cost=# rows=#)
+    -> Custom index distance scan on idx_v  (cost=# rows=#)
+
+DEALLOCATE PREPARE s;
+SET @q = NULL;
+DROP TABLE t;
+DROP TABLE t_noidx;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

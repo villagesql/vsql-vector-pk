@@ -30,6 +30,7 @@ INSERT INTO t VALUES (10, 0x0000803F0000004000004040);
 # The query vector of a nearest-neighbour search, served by the index.
 SELECT id, L2_DISTANCE(v, 0x0000803F000000400000404000008040) AS dist
 FROM t ORDER BY dist, id;
+--replace_regex /\(cost=[0-9.e+]+ rows=[0-9.e+]+\)/(cost=# rows=#)/
 EXPLAIN FORMAT=TREE
 SELECT id FROM t ORDER BY L2_DISTANCE(v, 0x0000803F000000400000404000008040)
 LIMIT 3;
