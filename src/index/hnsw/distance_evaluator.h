@@ -26,6 +26,7 @@
 
 #include "../../distance_registry.h"
 #include "../../native_vector.h"
+#include "../../quantize.h"
 #include "hnsw.h"
 
 #include <bit>
@@ -54,9 +55,24 @@ namespace svector::hnsw {
 // must never come from a buffer whose address is reused with DIFFERENT
 // contents across calls, or a stale pointer-match would reuse the wrong
 // vector.
+//
+// Quantized operands: on an index with a VectorCache attached, an operand may
+// instead be a quant::QData -- the int16 form the cache holds. A comparison
+// runs the quantized kernel when either operand is in that form, and the f32
+// kernel otherwise; see eval().
 class DistanceEvaluator {
 public:
   using NativeDistFn = native::DistFn;
+
+  // The most bytes a QData for a vector of the indexed column can take, given
+  // the column's raw maximum value length buf_size. Not bounded by buf_size:
+  // padding to QVECTOR_DIM_PAD components makes a short vector's QData longer
+  // than its stored value.
+  static size_t max_qdata_length(size_t buf_size, uint32_t prefix) {
+    const size_t dim = buf_size > prefix ? (buf_size - prefix) / sizeof(float) : 0;
+    return quant::qdata_length(
+        quant::qvector_padded_dim(static_cast<uint32_t>(dim)));
+  }
 
   // helper_name is the distance helper the profile bound at fn_id 1 (the caller
   // reads it from the server and passes it in); the evaluator maps it to a
@@ -67,7 +83,9 @@ public:
   // off each value before its floats.
   DistanceEvaluator(const char *helper_name, size_t buf_size, uint32_t prefix)
       : m_fn(native::dist_for_name(helper_name)), m_prefix(prefix),
-        m_scratch_a(buf_size), m_scratch_b(buf_size) {
+        m_scratch_a(buf_size), m_scratch_b(buf_size),
+        m_qbuf_a(max_qdata_length(buf_size, prefix)),
+        m_qbuf_b(max_qdata_length(buf_size, prefix)) {
     if (m_fn == nullptr && helper_name != nullptr) {
       // Keep the name for eval()'s error; the buffer is small and fixed.
       std::strncpy(m_helper_name, helper_name, sizeof(m_helper_name) - 1);
@@ -76,6 +94,79 @@ public:
 
   bool valid() const { return m_fn != nullptr; }
 
+  // Enable quantized operands, padded to padded_dim int16 components. Set once
+  // when an index attaches a cache, never per call. It does not make every
+  // operand quantized: a vector the cache refused stays in its stored form,
+  // and eval() picks the kernel per comparison.
+  //
+  // L2 only for now: quantize.h has dist_squared_l2_q and nothing else, and
+  // IndexGraph::set_vector_cache() refuses a cache on other metrics.
+  void set_quantized(uint32_t padded_dim) {
+    m_quantized = true;
+    m_padded_dim = padded_dim;
+  }
+  bool quantized() const { return m_quantized; }
+
+  // Record the quantized form of the fixed operand, produced once per search
+  // by quantize_operand(). Held so a comparison against a CACHED vector can
+  // use it while one against an uncached vector still uses the f32 form --
+  // the two forms of operand a coexist for the whole search.
+  // `f32_src` is the stored form of the same vector, so eval() can recognise
+  // that an operand handed to it IS this prepared one rather than some node's
+  // bytes that merely happen to be unquantized.
+  void set_quantized_fixed_operand(const quant::QData *qa,
+                                   const unsigned char *f32_src) {
+    m_qa = qa;
+    m_fixed_f32_src = f32_src;
+  }
+
+  // Points out at the dim floats of the raw stored value v, read in place when
+  // possible (see floats()). Public so the cache fill path can hand them to
+  // VectorCache::insert() without a decode copy. The floats may live in this
+  // evaluator's scratch, so they are valid only until the next call into it.
+  // Returns true on error.
+  bool stored_floats(const Column::Data &v, const float *&out, uint32_t &dim,
+                     std::span<char> err) {
+    return floats(v, m_scratch_b, out, dim, err);
+  }
+
+  // Quantizes the raw stored value v into buf and returns it as a QData view
+  // in out. Used for the two vectors that never pass through the cache
+  // because they are not in the index: the query vector, and the vector being
+  // inserted. Returns true on error.
+  bool quantize_operand(const Column::Data &v, ScratchBytes &buf,
+                        Column::Data &out, std::span<char> err) {
+    const quant::QData *q = nullptr;
+    if (to_qdata(v, buf, &q, err))
+      return true;
+    out.data = reinterpret_cast<const unsigned char *>(q);
+    out.length = static_cast<uint32_t>(quant::qdata_length(m_padded_dim));
+    return false;
+  }
+
+  // Quantizes the dim floats at src into buf, buf_len bytes aligned for
+  // QData, and points *out at it. Returns true on error.
+  bool quantize(const float *src, uint32_t dim, void *buf, size_t buf_len,
+                const quant::QData **out, std::span<char> err) const {
+    if (dim > m_padded_dim) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: bad vector dimension (%u > %u)", dim,
+               m_padded_dim);
+      return true;
+    }
+    const size_t need = quant::qdata_length(m_padded_dim);
+    if (buf_len < need) {
+      snprintf(err.data(), err.size(),
+               "HNSW: distance: quantize buffer too small (%zu < %zu)",
+               buf_len, need);
+      return true;
+    }
+    auto *q = static_cast<quant::QData *>(buf);
+    quant::quantize(src, dim, m_padded_dim, q);
+    *out = q;
+    return false;
+  }
+
   // Resolve a and b to their floats (a reused per the model above), compute
   // the distance, write it to out. Returns true on error (writes err). err is a
   // non-owning buffer. out is double -- IndexGraph::DistanceType -- taken
@@ -83,8 +174,55 @@ public:
   // type.
   bool eval(const Column::Data &a, const Column::Data &b, double &out,
             std::span<char> err) {
+    return eval(a, b, false, false, out, err);
+  }
+
+  // As above, but a_quantized/b_quantized say which form each operand is in:
+  // true for a QData the cache served, false for a stored value. It is a
+  // per-COMPARISON choice, not a per-index one, so a vector the cache refused
+  // costs a page read and nothing more.
+  bool eval(const Column::Data &a, const Column::Data &b, bool a_quantized,
+            bool b_quantized, double &out, std::span<char> err) {
     if (m_fn == nullptr) {
       return unresolved(err);
+    }
+    // A quantized operand has no f32 form to fall back to -- the cache holds
+    // only the QData -- so once EITHER operand is quantized the comparison has
+    // to run the quantized kernel, and the other operand must be brought into
+    // that form.
+    //
+    // Three ways that resolves, cheapest first:
+    //   both quantized          -- the common case once the cache is warm
+    //   a is the fixed operand  -- its quantized copy was made once per search
+    //   mixed                   -- quantize the unquantized one here
+    //
+    // Only the third costs anything, and only on a pair where one vector is
+    // resident and the other was refused. Quantizing EVERY uncached read
+    // instead measured 3.6x slower on build and 0.41x on queries once the
+    // cache was full, because the result was discarded every time.
+    //
+    // TODO(villagesql-indexing): the mixed pair quantizes the uncached operand
+    // and throws the result away. Between graph nodes, IndexGraph's per-call
+    // DecodedVectorCache keeps that quantized copy for the rest of the call;
+    // here, against a query or insert vector, nothing does. Mixed pairs only
+    // occur while the cache is partially filled or full, so this is unmeasured
+    // at scale; worth revisiting if a workload sits in that state.
+    if (a_quantized || b_quantized) {
+      const quant::QData *qa = nullptr;
+      const quant::QData *qb = nullptr;
+      if (a_quantized) {
+        qa = reinterpret_cast<const quant::QData *>(a.data);
+      } else if (m_qa != nullptr && a.data == m_fixed_f32_src) {
+        qa = m_qa;
+      } else if (to_qdata(a, m_qbuf_a, &qa, err)) {
+        return true;
+      }
+      if (b_quantized) {
+        qb = reinterpret_cast<const quant::QData *>(b.data);
+      } else if (to_qdata(b, m_qbuf_b, &qb, err)) {
+        return true;
+      }
+      return eval(qa, qb, out, err);
     }
     // Operand a is fixed across a traversal's candidates, so reuse it when the
     // source pointer is unchanged; b always varies.
@@ -119,6 +257,17 @@ public:
     return false;
   }
 
+  // Computes the distance between two quantized operands. Returns true on
+  // error.
+  bool eval(const quant::QData *a, const quant::QData *b, double &out,
+            std::span<char> err) {
+    if (m_fn == nullptr) {
+      return unresolved(err);
+    }
+    out = quant::dist_squared_l2_q(a, b, m_padded_dim);
+    return false;
+  }
+
   // Decodes the raw stored value v into buf, which must be buf_len bytes
   // aligned for native::Data, and points *dp at it. Returns true on error.
   bool decode(const Column::Data &v, void *buf, size_t buf_len,
@@ -145,6 +294,18 @@ public:
   }
 
 private:
+  // Quantizes the raw stored value v into buf, for an operand compared against
+  // a quantized one. Each operand has its own buf, so the two sides of one
+  // comparison cannot overwrite each other.
+  bool to_qdata(const Column::Data &v, ScratchBytes &buf,
+                const quant::QData **out, std::span<char> err) {
+    const float *f = nullptr;
+    uint32_t dim = 0;
+    if (floats(v, m_scratch_b, f, dim, err))
+      return true;
+    return quantize(f, dim, buf.data(), buf.size(), out, err);
+  }
+
   bool unresolved(std::span<char> err) const {
     snprintf(err.data(), err.size(),
              "HNSW: distance: unresolved distance function (helper '%s')",
@@ -195,6 +356,17 @@ private:
   const unsigned char *m_a_src = nullptr;
   const float *m_a_floats = nullptr;
   uint32_t m_a_dim = 0;
+  // Quantize scratch for the mixed case; one per operand so a comparison's two
+  // sides never share a buffer. Sized by max_qdata_length().
+  ScratchBytes m_qbuf_a;
+  ScratchBytes m_qbuf_b;
+  // Set by set_quantized().
+  bool m_quantized = false;
+  uint32_t m_padded_dim = 0;
+  // The fixed operand's quantized form and the stored bytes it came from; see
+  // set_quantized_fixed_operand().
+  const quant::QData *m_qa = nullptr;
+  const unsigned char *m_fixed_f32_src = nullptr;
   // The bound helper name, kept only when it did not resolve, for eval()'s
   // error message. Same 64-byte cap the server name lookup uses.
   char m_helper_name[64] = {};

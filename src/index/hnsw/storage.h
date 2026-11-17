@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <optional>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@
 
 #include "../../storage/storage.h"
 #include "hnsw.h"
+#include "vector_cache.h"
 #include "pk_layout.h"
 #include <villagesql/preview/index_builder.h>
 
@@ -54,6 +56,50 @@ inline constexpr long long MAX_EF_SEARCH = 65536;
 
 // Reads the connection's vsql_vector.ef_search value. Defined in vector.cc.
 long long read_ef_search();
+
+// How much of the index the search serves from memory rather than pages.
+// Ordered by how much is cached, so a > comparison asks "at least this much".
+//
+// Set by the global vsql_vector.cache_mode, because a cache lives on the
+// IndexStore and is shared by every session. It belongs on the index rather
+// than the server, since each index has its own cache; everything reads it
+// through read_cache_mode() at the point of use, so that move is local.
+enum CacheMode : long long {
+  // Everything from pages, no cache. The pre-cache behaviour.
+  CACHE_NONE = 0,
+  // Graph from pages; vectors cached by VID, quantized to int16, behind
+  // IndexGraph::resolve_node_data(). The cache reserves
+  // vsql_vector.max_cache_size bytes per index up front, fills until full, and
+  // then stops admitting; a vector it does not hold costs a page read.
+  CACHE_VECTORS = 1,
+  // Upper levels (>= 1) served from pinned in-memory nodes with pointer edges;
+  // level 0 from pages + the vector cache. Levels hold ~1/M of the level below,
+  // so the pinned set is ~6% of nodes and bounded.
+  CACHE_LAYERS = 2,
+  // Every level from pinned in-memory nodes. Fastest, but the whole node
+  // skeleton must fit: ~3 GB at 10M rows, ~31 GB at 100M.
+  CACHE_FULL = 3,
+};
+
+inline constexpr long long DEFAULT_CACHE_MODE = CACHE_NONE;
+
+// The highest mode actually implemented. CACHE_LAYERS and CACHE_FULL are
+// declared above because they are the designs being evaluated, but neither is
+// built: the sysvar refuses them rather than silently falling back to
+// CACHE_VECTORS, which would make a benchmark of them look like a null result.
+inline constexpr long long MAX_IMPLEMENTED_CACHE_MODE = CACHE_VECTORS;
+
+// Default and bounds for vsql_vector.max_cache_size (bytes, per index).
+// MariaDB's equivalent mhnsw_max_cache_size defaults to 16 MB, which is far
+// too small for any real index -- 512 MB holds the whole 60k x 784 benchmark
+// set with room to spare.
+inline constexpr long long DEFAULT_MAX_CACHE_SIZE = 512LL * 1024 * 1024;
+inline constexpr long long MIN_MAX_CACHE_SIZE = 0;
+inline constexpr long long MAX_MAX_CACHE_SIZE = 1LL << 44;  // 16 TB
+
+// Read the global cache settings. Defined in vector.cc.
+long long read_cache_mode();
+long long read_max_cache_size();
 
 // Options parsed from WITH (...) at CREATE INDEX time.
 struct Options {
@@ -554,7 +600,30 @@ private:
   // store), fixed at create/load from the key shape.
   PkLayout m_pk_layout;
 
+  // Vector cache for the paged search path, created on first use if the mode
+  // asks for one. Lives here rather than on IndexGraph because an IndexGraph is
+  // constructed per operation while the cache has to persist across queries.
+  std::unique_ptr<VectorCache> m_vector_cache;
+  // Caches replaced by a budget or mode change. See retire_vector_cache().
+  std::vector<std::unique_ptr<VectorCache>> m_retired_vector_caches;
+  // Guards construction and replacement of m_vector_cache only.
+  std::mutex m_vector_cache_mutex;
+
 public:
+  // The vector cache for this index, creating it on first call when the cache
+  // mode asks for one, or nullptr when it does not. The mode is read HERE, per
+  // call, rather than captured at construction -- so moving it from a sysvar to
+  // a per-index setting later is a change to one function, not a restructure.
+  // dim is the indexed column's component count; the cache needs it to
+  // quantize, and every entry is sized from it.
+  VectorCache *vector_cache(uint32_t dim);
+
+  // Set the current cache aside, to be released with the store, when the mode
+  // is turned off or the budget changes.
+  void retire_vector_cache();
+  // Drop vid's entry, when the VID is freed or reused by a write.
+  void invalidate_vector_cache(VID vid);
+
   // Resolve the primary key for the level-0 node named by nid into out_parts
   // (one entry per key part), copied out. For an inlined key the single part
   // comes from the node field; for a spilled key it is unpacked from the PK
