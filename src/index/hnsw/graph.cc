@@ -109,7 +109,13 @@ bool IndexGraph::resolve_node_data(VID vid, ScratchBytes &buf, NodeData &out) {
   // copy; out points straight at it. The address is stable per vid for as long
   // as the entry is resident, unlike the scratch buffer below.
   if (m_vector_cache != nullptr) {
-    if (const quant::QData *q = m_vector_cache->get(vid)) {
+    const quant::QData *q = take_peeked(vid);
+    if (q != nullptr) {
+      m_vector_cache->count_hit();
+    } else {
+      q = m_vector_cache->get(vid);
+    }
+    if (q != nullptr) {
       out.data.data = reinterpret_cast<const unsigned char *>(q);
       out.data.length = static_cast<uint32_t>(
           quant::qdata_length(m_vector_cache->padded_dim()));
