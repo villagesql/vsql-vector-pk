@@ -1,0 +1,35 @@
+SET PERSIST vsql_allow_preview_extensions = ON;
+INSTALL EXTENSION vsql_vector;
+SET @saved_cache_mode = @@GLOBAL.vsql_vector.cache_mode;
+SET GLOBAL vsql_vector.cache_mode = 1;
+CREATE TABLE staging (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL
+) ENGINE=InnoDB;
+CREATE TABLE t (
+id INT PRIMARY KEY,
+v  SVECTOR(4) NOT NULL,
+INDEX idx_v (v hnsw_l2) USING EXTENDED(hnsw) WITH (M = 8, ef_construction = 32)
+) ENGINE=InnoDB;
+INSERT INTO t SELECT id, v FROM staging WHERE id <= 300;
+SELECT VARIABLE_VALUE INTO @tomb0 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 0;
+INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 1;
+INSERT INTO t SELECT id, v FROM staging WHERE id > 300 AND id % 3 = 2;
+SELECT VARIABLE_VALUE INTO @tomb1 FROM performance_schema.global_status
+WHERE VARIABLE_NAME = 'vsql_vector.cache_tombstones';
+SELECT COUNT(*) AS rows_inserted FROM t;
+rows_inserted
+3000
+# No entry was retired: a node another insert admitted while its own
+# insert was still running holds the right vector and stays resident.
+SELECT @tomb1 - @tomb0 AS tombstones;
+tombstones
+0
+DROP TABLE t;
+DROP TABLE staging;
+SET GLOBAL vsql_vector.cache_mode = @saved_cache_mode;
+UNINSTALL EXTENSION vsql_vector;
+SET PERSIST vsql_allow_preview_extensions = OFF;
+RESET PERSIST vsql_allow_preview_extensions;

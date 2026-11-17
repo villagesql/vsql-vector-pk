@@ -28,6 +28,8 @@
 #include <cassert>
 #include <cstring>
 
+#include <sys/mman.h>
+
 namespace svector::hnsw {
 
 namespace {
@@ -48,18 +50,29 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
   m_limit = m_capacity;
   if (m_capacity == 0) return;  // budget below one entry: insert() uses scratch
 
-  // The slab is committed UP FRONT, for the whole budget, because that is what
-  // makes slot addresses stable for the cache's life -- growing it later would
-  // reallocate and invalidate every pointer a caller holds. So a budget is a
-  // reservation, not a ceiling that is grown into: setting max_cache_size to
-  // 512 MB costs 512 MB on the first query against the index, even if the
-  // index only needs 96 MB.
+  // The slab is RESERVED up front, for the whole budget, because that is what
+  // makes slot addresses stable for the cache's life: growing it later would
+  // move it and invalidate every pointer a caller holds. It is not COMMITTED
+  // up front. An anonymous mapping is backed by memory only as each page is
+  // first written, and fills write slots in order, so a 512 MB budget over an
+  // index that needs 96 MB costs 96 MB. Building the cache costs only the
+  // mapping call; zeroing the whole budget here would stall the first scan,
+  // and every scan waiting on the cache mutex behind it.
   //
-  // That is a deliberate trade (stable addresses are what let the kernel read
-  // an entry in place, which is the whole point of this cache) but it makes
-  // the default consequential. A future version could reserve the slab in
-  // chunks and chain them, keeping addresses stable while allocating lazily.
-  m_slab.resize(size_t{m_capacity} * m_entry_bytes);
+  // No MAP_NORESERVE: a budget the machine plainly cannot back is refused here
+  // rather than failing on some later fill. A refused mapping leaves the cache
+  // at capacity 0, so every insert is a refusal and the index runs from pages,
+  // as with no cache at all.
+  const size_t slab_bytes = size_t{m_capacity} * m_entry_bytes;
+  void *slab = mmap(nullptr, slab_bytes, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (slab == MAP_FAILED) {
+    m_capacity = 0;
+    m_limit = 0;
+    return;
+  }
+  m_slab = std::unique_ptr<unsigned char, SlabUnmap>(
+      static_cast<unsigned char *>(slab), SlabUnmap{slab_bytes});
   m_meta.resize(m_capacity);
 
   const uint64_t buckets = round_up_pow2(
@@ -68,6 +81,16 @@ VectorCache::VectorCache(size_t max_bytes, uint32_t dim, uint32_t padded_dim)
   // let each element default-construct in place.
   m_index = std::vector<Bucket>(static_cast<size_t>(buckets));
   m_index_mask = buckets - 1;
+}
+
+VectorCache::~VectorCache() {
+  // Retired entries already left the gauge in invalidate(), so only what is
+  // still resident comes off here.
+  stat_add(vcache_resident_bytes, -static_cast<long long>(resident_bytes()));
+}
+
+void VectorCache::SlabUnmap::operator()(unsigned char *p) const {
+  munmap(p, bytes);
 }
 
 VectorCache::Bucket *VectorCache::probe(uint64_t vid) {
